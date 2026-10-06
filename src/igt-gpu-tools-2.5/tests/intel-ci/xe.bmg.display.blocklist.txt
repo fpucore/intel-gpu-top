@@ -1,0 +1,183 @@
+#########################################
+# non-KMS tests
+#########################################
+igt@(?!.*kms|testdisplay|fbdev|.*display-vs-wb-transient)(.*)
+#########################################
+# Valid skip :- Y and Yf-Tiling are not supported
+#########################################
+igt@kms_(big_fb|ccs|rotation_crc)@.*(y|yf)-(tiled|tile).*
+igt@kms_(plane_lowres|frontbuffer_tracking|plane_multiple)@.*tiling-y.*
+igt@kms_flip_scaled_crc@.*(yf|y)tile.*
+igt@kms_async_flips@invalid-async-flip
+igt@kms_addfb_basic@addfb25-y-tiled-small-legacy
+igt@kms_pipe_stress@stress-xrgb8888-(y|yf)tiled
+igt@kms_plane@pixel-format-(y|yf)-tiled.*
+#########################################
+# Valid skip :- 90/270 rotation is not supported
+##########################################
+igt@kms_big_fb@.*rotate-(90|270)
+igt@kms_rotation_crc@.*rotation-(90|270)
+igt@kms_rotation_crc@bad-(pixel-format|tiling)
+igt@kms_rotation_crc@sprite-rotation-90-pos-100-0
+##########################################
+# Valid skip :- Mutable zpos is not supported
+##########################################
+igt@kms_atomic@plane-primary-overlay-mutable-zpos
+##########################################
+# Valid skip :- Requires TV connector
+##########################################
+igt@kms_tv_load_detect@load-detect
+##########################################
+# Valid skip :- Scaling mode none is not supported
+##########################################
+igt@kms_scaling_modes@scaling-mode-none
+##########################################
+# Valid skip :- Valid for display ver > 13
+##########################################
+igt@kms_psr2_su@.*
+##########################################
+# Valid skip :-  Cursor sizes of 32 and greater than 256 are not supported
+##########################################
+igt@kms_cursor_crc@.*-max-size
+igt@kms_cursor_crc@.*-(32x10|32x32|512x)
+##########################################
+# Valid skip :- Downscaling factor is not supported
+##########################################
+igt@kms_plane_scaling@.*downscale-factor-0-25.*
+igt@kms_plane_scaling@planes-upscale-factor-0-25-downscale-factor-0-(5|75)
+##########################################
+# Valid skip :- Downscaling is not supported on second plane MTL+
+##########################################
+igt@kms_plane_scaling@planes-downscale-factor-0-(5|75)$
+igt@kms_plane_scaling@planes-.*upscale-.*downscale
+##########################################
+# Valid skip :- Unsupported cursor size
+##########################################
+igt@kms_cursor_crc@.*64x21
+igt@kms_cursor_crc@.*128x42
+igt@kms_cursor_crc@.*256x85
+igt@kms_cursor_crc@cursor-(offscreen|onscreen|random|rapid-movement|sliding)-512x(512|170)
+##########################################
+# Valid skip :- BMG doesn't have eDP support
+##########################################
+igt@kms_vrr@seamless-rr-switch-vrr
+igt@kms_vrr@cmrr.*
+igt@kms_atomic_transition@.*-internal-panels$
+igt@.*psr.*
+igt@kms_pm_backlight@.*
+igt@kms_pm_power_saving@.*
+igt@kms_scaling_modes@.*
+igt@kms_panel_fitting@.*
+igt@.*@.*(?!no-)drrs.*
+#########################################
+# Valid skip :- Require VGA connector
+#########################################
+igt@.*chamelium.*vga.*
+##########################################
+# Valid skip :- GSC not present in BMG
+##########################################
+igt@kms_content_protection@content-type-change
+igt@kms_content_protection@lic-type-1
+igt@kms_content_protection@type1
+##########################################
+# Valid skip :-
+##########################################
+igt@kms_content_protection@mei-interface
+#########################################
+# Valid skip :- BMG doesn't have PORT_A/B
+#########################################
+igt@kms_pm_rpm@modeset-lpsp
+igt@kms_pm_rpm@modeset-lpsp-stress
+igt@kms_pm_rpm@dpms-mode-unset-lpsp
+igt@kms_pm_rpm@dpms-lpsp
+igt@kms_pm_lpsp@kms-lpsp
+igt@kms_pm_rpm@modeset-lpsp-stress-no-wait
+#########################################
+# Valid skip :- Flat ccs has only one buffer
+#########################################
+igt@kms_getfb@getfb-reject-ccs
+#########################################
+# Valid skip :- Valid for graphics ver >= 20
+#########################################
+igt@kms_getfb@getfb2-accept-ccs
+igt@kms_vrr@lobf
+##########################################
+# Valid skip :- DC6 is not supported by dgfx
+#########################################
+igt@kms_pm_dc@deep-pkgc
+igt@kms_pm_dc@dc6-dpms
+#########################################
+# Valid skip :- BMG has only one cdclk (WA)
+#########################################
+igt@kms_cdclk@.*
+##########################################
+# Valid skip :- DG2/LNL/MTL specific
+##########################################
+igt@kms_ccs@.*-dg2-.*
+igt@kms_ccs@.*-lnl-.*
+igt@kms_ccs@.*-mtl-.*
+igt@kms_flip_scaled_crc@.*dg2rcccs.*
+igt@kms_plane@pixel-format.*(mtl|dg2).*
+##########################################
+# Valid skip :- Simulation specific
+##########################################
+igt@kms_simulation_hpd@sim-hpd
+#########################################
+#########################################
+# Valid skip :- Require non-hybrid configuration
+#########################################
+igt@kms_addfb_basic@invalid-smem-bo-on-discrete
+#########################################
+# crc-random cases are resource intensive
+#########################################
+igt@.*chamelium.*random.*
+##########################################
+# Valid skip :- Cursor moving doesn't take slowpath
+##########################################
+igt@kms_cursor_legacy@(short|basic)-busy-flip-before
+igt@kms_cursor_legacy@short-busy-flip-before-cursor-atomic-(transitions|transitions-varying-size)
+igt@kms_cursor_legacy@short-busy-flip-before-cursor-toggle
+igt@kms_cursor_legacy@basic-busy-flip-before-cursor-(atomic|legacy|varying-size)
+##########################################
+# Valid skip :- Use of a single CRTC for two connectors
+##########################################
+igt@kms_setmode@basic-clone-single-crtc
+##########################################
+# Valid skip :- Connector uses CRTC that is incompatible
+#		with the connector
+##########################################
+igt@kms_setmode@invalid-clone-exclusive-crtc
+##########################################
+# Valid skip :- For display ver < 20
+##########################################
+igt@kms_frontbuffer_tracking@plane-fbc-rte
+igt@.*sharpness_filter.*
+#########################################
+# Valid skip :- Unsupported for platform with Wa_16023588340
+#########################################
+igt@kms.*fbc.*
+#########################################
+# Valid skip :- Use either of linear-tiling or
+#               connected-linear-tiling
+#########################################
+igt@kms_bw@linear-tiling-.*-display.*
+#########################################
+# Valid skip :- Linear + hflip combination is not supported on BMG
+#########################################
+igt@kms_big_fb@linear-max-hw-stride.*hflip
+#########################################
+# Valid skip :- For display ver >= 30
+#########################################
+igt@kms_pm_dc@dc5-retention-flops
+#########################################
+# Valid skip : 3D LUT is supported NVL+
+########################################
+igt@kms_color_pipeline@plane-lut3d-green-only
+########################################
+# Valid skip :- For display ver >= 35
+########################################
+igt@kms_frontbuffer_tracking@.*a(bgr|rgb)161616f.*
+igt@kms_flip_scaled_crc@.*linear-reflect-x
+igt@kms_pm_dc@dc3co-.*
+igt@kms_vrr@lobf-dc3co
+########################################

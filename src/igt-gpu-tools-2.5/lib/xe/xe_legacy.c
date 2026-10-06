@@ -1,0 +1,304 @@
+// SPDX-License-Identifier: MIT
+/*
+ * Copyright © 2025 Intel Corporation
+ */
+
+#include "intel_pat.h"
+#include "lib/igt_syncobj.h"
+#include "linux_scaffold.h"
+#include "xe/xe_gt.h"
+#include "xe/xe_ioctl.h"
+#include "xe/xe_legacy.h"
+#include "xe/xe_spin.h"
+
+/* Batch buffer element count, in number of dwords(u32) */
+#define BATCH_DW_COUNT			16
+#define SECONDARY_QUEUE			(0x1 << 15)
+#define MULTI_QUEUE			(0x1 << 14)
+#define COMPRESSION			(0x1 << 13)
+#define SYSTEM				(0x1 << 12)
+#define LONG_SPIN_REUSE_QUEUE		(0x1 << 11)
+#define LONG_SPIN			(0x1 << 8)
+#define CANCEL				(0x1 << 7)
+#define PREEMPT				(0x1 << 6)
+#define CAT_ERROR			(0x1 << 5)
+#define CLOSE_EXEC_QUEUES		(0x1 << 2)
+#define CLOSE_FD			(0x1 << 1)
+/* Batch buffer element count, in number of dwords(u32) */
+#define GT_RESET			(0x1 << 0)
+#define MAX_N_EXECQUEUES		16
+
+/**
+ * xe_legacy_test_mode:
+ * @fd: file descriptor
+ * @eci: engine class instance
+ * @n_exec_queues: number of exec queues
+ * @n_execs: number of execs
+ * @flags: flags for the test
+ * @addr: address for the test
+ * @use_capture_mode: use capture mode or not
+ *
+ * Returns: void
+ */
+void
+xe_legacy_test_mode(int fd, struct drm_xe_engine_class_instance *eci,
+		    int n_exec_queues, int n_execs, unsigned int flags,
+		    u64 addr, bool use_capture_mode)
+{
+	u32 vm;
+	struct drm_xe_sync sync[2] = {
+		{ .type = DRM_XE_SYNC_TYPE_SYNCOBJ, .flags = DRM_XE_SYNC_FLAG_SIGNAL, },
+		{ .type = DRM_XE_SYNC_TYPE_SYNCOBJ, .flags = DRM_XE_SYNC_FLAG_SIGNAL, },
+	};
+	struct drm_xe_exec exec = {
+		.num_batch_buffer = 1,
+		.num_syncs = 2,
+		.syncs = to_user_pointer(sync),
+	};
+	u32 exec_queues[MAX_N_EXECQUEUES];
+	u32 syncobjs[MAX_N_EXECQUEUES];
+	size_t bo_size;
+	u32 bo = 0;
+	struct {
+		struct xe_spin spin;
+		u32 batch[BATCH_DW_COUNT];
+		u64 pad;
+		u32 data;
+	} *data;
+	struct xe_spin_opts spin_opts = {
+		.preempt = flags & PREEMPT,
+		.multi_queue_switch = flags & MULTI_QUEUE,
+		.use_queue_timestamp = flags & MULTI_QUEUE,
+#define THREE_SEC	(3 * 1000000000ull)
+		.ctx_ticks = flags & LONG_SPIN ?
+			xe_spin_nsec_to_ticks(fd, 0, THREE_SEC) : 0,
+	};
+	int i, b;
+	int hang_position = flags & SECONDARY_QUEUE ? 1 : 0;
+	int extra_execs = (flags & LONG_SPIN_REUSE_QUEUE) ? n_exec_queues : 0;
+
+	igt_assert_lte(n_exec_queues, MAX_N_EXECQUEUES);
+
+	igt_assert_f(!(flags & SECONDARY_QUEUE) || (flags & MULTI_QUEUE),
+		     "SECONDARY_QUEUE requires MULTI_QUEUE to be set");
+
+	if (flags & COMPRESSION)
+		igt_require(intel_gen(intel_get_drm_devid(fd)) >= 20);
+
+	if (flags & CLOSE_FD)
+		fd = drm_open_driver(DRIVER_XE);
+
+	vm = xe_vm_create(fd, 0, 0);
+	bo_size = sizeof(*data) * (n_execs + extra_execs);
+	bo_size = xe_bb_size(fd, bo_size);
+
+	if (flags & COMPRESSION) {
+		bo = xe_bo_create_caching(fd, vm, bo_size,
+					  flags & SYSTEM ?
+					  system_memory(fd) :
+					  vram_if_possible(fd, eci->gt_id),
+					  DRM_XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM,
+					  DRM_XE_GEM_CPU_CACHING_WC);
+	} else {
+		bo = xe_bo_create(fd, vm, bo_size,
+				  flags & SYSTEM ?
+				  system_memory(fd) :
+				  vram_if_possible(fd, eci->gt_id),
+				  DRM_XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM);
+	}
+	data = xe_bo_map(fd, bo, bo_size);
+
+	for (i = 0; i < n_exec_queues; i++) {
+		if (flags & MULTI_QUEUE) {
+			struct drm_xe_ext_set_property multi_queue = {
+				.base.next_extension = 0,
+				.base.name = DRM_XE_EXEC_QUEUE_EXTENSION_SET_PROPERTY,
+				.property = DRM_XE_EXEC_QUEUE_SET_PROPERTY_MULTI_GROUP,
+			};
+
+			uint64_t ext = to_user_pointer(&multi_queue);
+
+			multi_queue.value = i ? exec_queues[0] : DRM_XE_MULTI_GROUP_CREATE;
+			exec_queues[i] = xe_exec_queue_create(fd, vm, eci, ext);
+		} else {
+			exec_queues[i] = xe_exec_queue_create(fd, vm, eci, 0);
+		}
+		syncobjs[i] = syncobj_create(fd, 0);
+	}
+
+	sync[0].handle = syncobj_create(fd, 0);
+
+	/* Binding mechanism based on use_capture_mode */
+	if (flags & COMPRESSION) {
+		int ret;
+
+		ret = __xe_vm_bind(fd, vm, 0, bo, 0, addr, bo_size,
+				   DRM_XE_VM_BIND_OP_MAP, 0, sync, 1, 0,
+				   intel_get_pat_idx_uc_comp(fd), 0);
+		igt_assert(!ret);
+	} else if (use_capture_mode) {
+		__xe_vm_bind_assert(fd, vm, 0, bo, 0, addr, bo_size,
+				    DRM_XE_VM_BIND_OP_MAP, flags, sync, 1, 0, 0);
+	} else {
+		xe_vm_bind_async(fd, vm, 0, bo, 0, addr, bo_size, sync, 1);
+	}
+
+	for (i = 0; i < n_execs; i++) {
+		u64 base_addr = (!use_capture_mode && flags & CAT_ERROR &&
+				 i == hang_position) ?
+				(addr + bo_size * 128) : addr;
+		u64 batch_offset = (char *)&data[i].batch - (char *)data;
+		u64 batch_addr = base_addr + batch_offset;
+		u64 spin_offset = (char *)&data[i].spin - (char *)data;
+		u64 sdi_offset = (char *)&data[i].data - (char *)data;
+		u64 sdi_addr = base_addr + sdi_offset;
+		u64 exec_addr;
+		int err, e = i % n_exec_queues;
+
+		/*
+		 * For cat fault on a secondary queue the fault will
+		 * be on the spinner.
+		 */
+		if (i == hang_position || flags & CANCEL ||
+		    (flags & LONG_SPIN && i < n_exec_queues)) {
+			spin_opts.addr = base_addr + spin_offset;
+			xe_spin_init(&data[i].spin, &spin_opts);
+			exec_addr = spin_opts.addr;
+		} else {
+			b = 0;
+			data[i].batch[b++] = MI_STORE_DWORD_IMM_GEN4;
+			data[i].batch[b++] = sdi_addr;
+			data[i].batch[b++] = sdi_addr >> 32;
+			data[i].batch[b++] = 0xc0ffee;
+			data[i].batch[b++] = MI_BATCH_BUFFER_END;
+			igt_assert(b <= ARRAY_SIZE(data[i].batch));
+
+			exec_addr = batch_addr;
+		}
+
+		sync[0].flags &= ~DRM_XE_SYNC_FLAG_SIGNAL;
+		sync[1].flags |= DRM_XE_SYNC_FLAG_SIGNAL;
+		sync[1].handle = syncobjs[e];
+
+		exec.exec_queue_id = exec_queues[e];
+		exec.address = exec_addr;
+
+		if (e != i)
+			syncobj_reset(fd, &syncobjs[e], 1);
+
+		/*
+		 * Secondary queues are reset when the primary queue
+		 * is reset. The submission can race here and it is
+		 * expected for those to fail submission if the primary
+		 * reset has already happened.
+		 */
+		err = __xe_exec(fd, &exec);
+		igt_assert(!err || ((flags & MULTI_QUEUE) && err == -ECANCELED));
+
+		if (i == hang_position && !(flags & CAT_ERROR) &&
+		    !use_capture_mode && !(flags & COMPRESSION))
+			xe_spin_wait_started(&data[i].spin);
+	}
+
+	if (flags & GT_RESET)
+		xe_force_gt_reset_async(fd, eci->gt_id);
+
+	if (flags & CLOSE_FD) {
+		if (flags & CLOSE_EXEC_QUEUES) {
+			for (i = 0; i < n_exec_queues; i++)
+				xe_exec_queue_destroy(fd, exec_queues[i]);
+		}
+		drm_close_driver(fd);
+		/* FIXME: wait for idle */
+		usleep(150000);
+		return;
+	}
+
+	for (i = 0; i < n_exec_queues && n_execs; i++) {
+		/*
+		 * Expectation here is that on reset, submissions will
+		 * still satisfy the syncobj_wait.
+		 */
+		int err = syncobj_wait_err(fd, &syncobjs[i], 1, INT64_MAX, 0);
+
+		/*
+		 * Currently any time GuC resets a queue which is part of a
+		 * multi queue queue group submitted by the KMD, the KMD
+		 * will tear down the entire group. This means we don't know
+		 * whether a particular queue submitted prior to the hanging
+		 * queue will complete or not. So we have to check all possible
+		 * return values here.
+		 *
+		 * In the event we get an -ECANCELED at the exec above and the
+		 * syncobj was not installed, we expect this to return -EINVAL
+		 * here instead.
+		 */
+		igt_assert(!err || ((flags & MULTI_QUEUE) && err == -EINVAL));
+	}
+
+	igt_assert(syncobj_wait(fd, &sync[0].handle, 1, INT64_MAX, 0, NULL));
+
+	for (i = n_execs; i < n_execs + extra_execs; i++) {
+		u64 base_addr = (!use_capture_mode && (flags & CAT_ERROR) && !i)
+			? (addr + bo_size * 128) : addr;
+		u64 batch_offset = (char *)&data[i].batch - (char *)data;
+		u64 batch_addr = base_addr + batch_offset;
+		u64 sdi_offset = (char *)&data[i].data - (char *)data;
+		u64 sdi_addr = base_addr + sdi_offset;
+		u64 exec_addr;
+		int e = i % n_exec_queues;
+
+		b = 0;
+		data[i].batch[b++] = MI_STORE_DWORD_IMM_GEN4;
+		data[i].batch[b++] = sdi_addr;
+		data[i].batch[b++] = sdi_addr >> 32;
+		data[i].batch[b++] = 0xc0ffee;
+		data[i].batch[b++] = MI_BATCH_BUFFER_END;
+		igt_assert(b <= ARRAY_SIZE(data[i].batch));
+
+		exec_addr = batch_addr;
+
+		sync[0].flags &= ~DRM_XE_SYNC_FLAG_SIGNAL;
+		sync[1].flags |= DRM_XE_SYNC_FLAG_SIGNAL;
+		sync[1].handle = syncobjs[e];
+
+		exec.exec_queue_id = exec_queues[e];
+		exec.address = exec_addr;
+
+		syncobj_reset(fd, &syncobjs[e], 1);
+		xe_exec(fd, &exec);
+	}
+
+	for (i = 0; i < n_exec_queues && extra_execs; i++)
+		igt_assert(syncobj_wait(fd, &syncobjs[i], 1, INT64_MAX, 0, NULL));
+
+	sync[0].flags |= DRM_XE_SYNC_FLAG_SIGNAL;
+	xe_vm_unbind_async(fd, vm, 0, 0, addr, bo_size, sync, 1);
+	igt_assert(syncobj_wait(fd, &sync[0].handle, 1, INT64_MAX, 0, NULL));
+
+	if (!use_capture_mode && !(flags & (GT_RESET | CANCEL | COMPRESSION))) {
+		for (i = flags & LONG_SPIN ? n_exec_queues : 0;
+		     i < n_execs + extra_execs; i++) {
+			/*
+			 * For multi-queue there is no guarantee which
+			 * queue will be scheduled first as they are all
+			 * submitted at the same priority in this test.
+			 * So we can't guarantee any data integrity here.
+			 */
+			if (i == hang_position || flags & MULTI_QUEUE)
+				continue;
+
+			igt_assert_eq(data[i].data, 0xc0ffee);
+		}
+	}
+
+	syncobj_destroy(fd, sync[0].handle);
+	for (i = 0; i < n_exec_queues; i++) {
+		syncobj_destroy(fd, syncobjs[i]);
+		xe_exec_queue_destroy(fd, exec_queues[i]);
+	}
+
+	munmap(data, bo_size);
+	gem_close(fd, bo);
+	xe_vm_destroy(fd, vm);
+}

@@ -1,0 +1,1146 @@
+// SPDX-License-Identifier: MIT
+/*
+ * Copyright © 2025 Intel Corporation
+ */
+
+/**
+ * TEST: Basic tests for exec functionality with multi-queue feature
+ * Category: Core
+ * Mega feature: Multi-Queue
+ * Sub-category: Multi-Queue tests
+ * Functionality: multi-queue
+ */
+
+#include "igt.h"
+#include "xe_drm.h"
+#include "igt_core.h"
+#include "lib/igt_syncobj.h"
+
+#include "xe/xe_ioctl.h"
+#include "xe/xe_query.h"
+#include "xe/xe_spin.h"
+
+#define XE_EXEC_QUEUE_PRIORITY_LOW	0
+#define XE_EXEC_QUEUE_PRIORITY_NORMAL	1
+#define XE_EXEC_QUEUE_PRIORITY_HIGH	2
+#define XE_EXEC_QUEUE_NUM_PRIORITIES	3
+#define XE_EXEC_QUEUE_PRIORITY_N	(XE_EXEC_QUEUE_NUM_PRIORITIES * 2 + 1)
+
+#define MAX_N_EXEC_QUEUES	64
+
+#define USERPTR			(0x1 << 0)
+#define PRIORITY		(0x1 << 1)
+#define CLOSE_FD		(0x1 << 2)
+#define PREEMPT_MODE		(0x1 << 3)
+#define DYN_PRIORITY		(0x1 << 4)
+#define INVALIDATE		(0x1 << 5)
+#define FAULT_MODE		(0x1 << 6)
+#define SMEM			(0x1 << 7)
+#define WAIT_MODE		(0x1 << 8)
+
+#define MAX_INSTANCE 9
+
+#define XE_MULTI_GROUP_VALID_FLAGS   (DRM_XE_MULTI_GROUP_CREATE)
+
+#define BASE_ADDRESS	0x1a0000
+
+/* Number of queues in exec sanity tests */
+#define NUM_QUEUES		2
+
+static void
+__test_sanity(int fd, int gt, int class, bool preempt_mode)
+{
+	uint32_t exec_queues[MAX_N_EXEC_QUEUES];
+	struct drm_xe_ext_set_property multi_queue = {
+		.base.name = DRM_XE_EXEC_QUEUE_EXTENSION_SET_PROPERTY,
+		.property = DRM_XE_EXEC_QUEUE_SET_PROPERTY_MULTI_GROUP,
+		.value = DRM_XE_MULTI_GROUP_CREATE,
+	};
+	struct drm_xe_ext_set_property mq_priority = {
+		.base.name = DRM_XE_EXEC_QUEUE_EXTENSION_SET_PROPERTY,
+		.property = DRM_XE_EXEC_QUEUE_SET_PROPERTY_MULTI_QUEUE_PRIORITY,
+	};
+	struct drm_xe_ext_set_property priority = {
+		.base.name = DRM_XE_EXEC_QUEUE_EXTENSION_SET_PROPERTY,
+		.property = DRM_XE_EXEC_QUEUE_SET_PROPERTY_PRIORITY,
+		.value = XE_EXEC_QUEUE_PRIORITY_NORMAL,
+	};
+	struct drm_xe_engine_class_instance vm_bind_eci = {
+		.engine_class = DRM_XE_ENGINE_CLASS_VM_BIND,
+	};
+	uint64_t invalid_flag = 0, ext = to_user_pointer(&multi_queue);
+	struct drm_xe_engine_class_instance eci[MAX_INSTANCE];
+	struct drm_xe_engine_class_instance *hwe;
+	uint32_t vm, vm2, val;
+	int i, n = 0;
+
+	xe_for_each_engine(fd, hwe) {
+		if (hwe->engine_class != class || hwe->gt_id != gt)
+			continue;
+
+		eci[n++] = *hwe;
+	}
+
+	if (!n)
+		return;
+
+	vm = xe_vm_create(fd, preempt_mode ? DRM_XE_VM_CREATE_FLAG_LR_MODE : 0, 0);
+
+	/* Invalid flags */
+	while (!invalid_flag)
+		invalid_flag = (1ull << (rand() % 63)) & ~XE_MULTI_GROUP_VALID_FLAGS;
+	multi_queue.value |= invalid_flag;
+	igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, 1, eci, ext, &val), -EINVAL);
+	multi_queue.value = DRM_XE_MULTI_GROUP_CREATE;
+
+	/* Queues can't be a vm_bind queues */
+	igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, 1, &vm_bind_eci, ext, &val), -EINVAL);
+	exec_queues[0] = xe_exec_queue_create(fd, vm, eci, 0);
+	multi_queue.value = exec_queues[0];
+	igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, 1, &vm_bind_eci, ext, &val), -EINVAL);
+	xe_exec_queue_destroy(fd, exec_queues[0]);
+	exec_queues[0] = xe_bind_exec_queue_create(fd, vm, 0);
+	multi_queue.value = exec_queues[0];
+	igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, 1, eci, ext, &val), -EINVAL);
+	xe_exec_queue_destroy(fd, exec_queues[0]);
+
+	/* Q0 can't be a regular queue */
+	exec_queues[0] = xe_exec_queue_create(fd, vm, eci, 0);
+	multi_queue.value = exec_queues[0];
+	igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, 1, eci, ext, &val), -EINVAL);
+	xe_exec_queue_destroy(fd, exec_queues[0]);
+
+	/* Multi-Queue can't be a parallel queue */
+	multi_queue.value = DRM_XE_MULTI_GROUP_CREATE;
+	if (n > 1 && xe_engine_class_supports_multi_lrc(fd, class))
+		igt_assert_eq(__xe_exec_queue_create(fd, vm, 2, 1, eci, ext, &val), -EINVAL);
+
+	/* Specifying multiple MULTI_GROUP property is invalid */
+	multi_queue.base.next_extension = to_user_pointer(&multi_queue);
+	igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, 1, eci, ext, &val), -EINVAL);
+
+	/* Setting other queue properties are valid for Q0 */
+	multi_queue.base.next_extension = to_user_pointer(&priority);
+	exec_queues[0] = xe_exec_queue_create(fd, vm, eci, ext);
+	xe_exec_queue_destroy(fd, exec_queues[0]);
+
+	/* Adding queues to group after primary is destroyed is invalid */
+	multi_queue.base.next_extension = 0;
+	exec_queues[0] = xe_exec_queue_create(fd, vm, eci, ext);
+	xe_exec_queue_destroy(fd, exec_queues[0]);
+	multi_queue.value = exec_queues[0];
+	igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, 1, eci, ext, &val), -ENOENT);
+
+	multi_queue.value = DRM_XE_MULTI_GROUP_CREATE;
+	exec_queues[0] = xe_exec_queue_create(fd, vm, eci, ext);
+
+	/* Upper 32 bits must be 0 while adding secondary queues */
+	multi_queue.value = exec_queues[0] | (1ull << (32 + (rand() % 32)));
+	igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, 1, eci, ext, &val), -EINVAL);
+
+	/* Invalid Q0 */
+	multi_queue.value = exec_queues[0] + 1;
+	igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, 1, eci, ext, &val), -ENOENT);
+
+	/* Queues in a queue group must share the same address space (vm) */
+	multi_queue.value = exec_queues[0];
+	vm2 = xe_vm_create(fd, preempt_mode ? DRM_XE_VM_CREATE_FLAG_LR_MODE : 0, 0);
+	igt_assert_eq(__xe_exec_queue_create(fd, vm2, 1, 1, eci, ext, &val), -EINVAL);
+	xe_vm_destroy(fd, vm2);
+
+	/* Secondary queues must map to same engine instances as primary queue */
+	if (n > 1)
+		igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, n, eci, ext, &val), -EINVAL);
+
+	/* Setting properties (other than MULTI_QUEUE_PRIORITY) is invalid for secondary queues */
+	multi_queue.base.next_extension = to_user_pointer(&priority);
+	igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, 1, eci, ext, &val), -EINVAL);
+
+	multi_queue.base.next_extension = 0;
+	for (i = 1; i < MAX_N_EXEC_QUEUES; i++)
+		exec_queues[i] = xe_exec_queue_create(fd, vm, eci, ext);
+
+	/* Queue group limit check */
+	igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, 1, eci, ext, &val), -EINVAL);
+
+	/* Secondary queues can't be replaced once successfully created */
+	xe_exec_queue_destroy(fd, exec_queues[1]);
+	igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, 1, eci, ext, &val), -EINVAL);
+
+	/* Primary queue can be destroyed before all secondary queues are destroyed */
+	xe_exec_queue_destroy(fd, exec_queues[0]);
+
+	for (i = 2; i < MAX_N_EXEC_QUEUES; i++)
+		xe_exec_queue_destroy(fd, exec_queues[i]);
+
+	/* Validate with multiple num_placements */
+	if (n > 1) {
+		multi_queue.value = DRM_XE_MULTI_GROUP_CREATE;
+		multi_queue.base.next_extension = 0;
+		igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, n, eci, ext, &exec_queues[0]), 0);
+
+		multi_queue.value = exec_queues[0];
+		for (i = 1; i < MAX_N_EXEC_QUEUES; i++)
+			igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, n, eci, ext, &exec_queues[i]), 0);
+
+		for (i = 0; i < MAX_N_EXEC_QUEUES; i++)
+			xe_exec_queue_destroy(fd, exec_queues[i]);
+	}
+
+	/* MQ priority is not valid for regular queues */
+	igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, 1, eci,
+					     to_user_pointer(&mq_priority), &val), -EINVAL);
+
+	/* MQ priority validation */
+	multi_queue.value = DRM_XE_MULTI_GROUP_CREATE;
+	multi_queue.base.next_extension = to_user_pointer(&mq_priority);
+	mq_priority.value = XE_EXEC_QUEUE_NUM_PRIORITIES;
+	igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, 1, eci, ext, &val), -EINVAL);
+
+	mq_priority.value = XE_EXEC_QUEUE_PRIORITY_HIGH;
+	exec_queues[0] = xe_exec_queue_create(fd, vm, eci, ext);
+	multi_queue.value = exec_queues[0];
+	exec_queues[1] = xe_exec_queue_create(fd, vm, eci, ext);
+	xe_exec_queue_destroy(fd, exec_queues[1]);
+	xe_exec_queue_destroy(fd, exec_queues[0]);
+
+	igt_fork(child, 1) {
+		igt_drop_root();
+
+		/* Tests MULTI_QUEUE_PRIORITY property by dropping root permissions */
+		multi_queue.value = DRM_XE_MULTI_GROUP_CREATE;
+		mq_priority.value = XE_EXEC_QUEUE_PRIORITY_HIGH;
+		exec_queues[0] = xe_exec_queue_create(fd, vm, eci, ext);
+		multi_queue.value = exec_queues[0];
+		exec_queues[1] = xe_exec_queue_create(fd, vm, eci, ext);
+		xe_exec_queue_destroy(fd, exec_queues[1]);
+		xe_exec_queue_destroy(fd, exec_queues[0]);
+	}
+	igt_waitchildren();
+
+	xe_vm_destroy(fd, vm);
+}
+
+/**
+ * SUBTEST: sanity
+ * Description: Run sanity test
+ * Test category: functionality test
+ */
+static void
+test_sanity(int fd, int gt, int class)
+{
+	__test_sanity(fd, gt, class, false);
+	__test_sanity(fd, gt, class, true);
+}
+
+static void
+__test_exec_sanity(int fd, struct drm_xe_engine_class_instance *eci, unsigned int flags)
+{
+#define USER_FENCE_VALUE	0xdeadbeefdeadbeefull
+	struct drm_xe_sync sync = { };
+	struct drm_xe_exec exec = {
+		.num_batch_buffer = 1,
+		.num_syncs = 1,
+		.syncs = to_user_pointer(&sync),
+	};
+	uint64_t vm_sync = 0, addr[NUM_QUEUES];
+	uint32_t vm, exec_queues[NUM_QUEUES], bo[NUM_QUEUES];
+	int64_t fence_timeout = NSEC_PER_SEC;
+	struct xe_spin *spin[NUM_QUEUES];
+	size_t bo_size;
+	struct drm_xe_ext_set_property multi_queue = {
+		.base.name = DRM_XE_EXEC_QUEUE_EXTENSION_SET_PROPERTY,
+		.property = DRM_XE_EXEC_QUEUE_SET_PROPERTY_MULTI_GROUP,
+		.value = DRM_XE_MULTI_GROUP_CREATE,
+	};
+	uint64_t ext = to_user_pointer(&multi_queue);
+	bool preempt_mode = flags & PREEMPT_MODE;
+	int i;
+
+	sync.flags = DRM_XE_SYNC_FLAG_SIGNAL;
+	if (preempt_mode) {
+		sync.type = DRM_XE_SYNC_TYPE_USER_FENCE;
+		sync.timeline_value = USER_FENCE_VALUE;
+	} else {
+		sync.type = DRM_XE_SYNC_TYPE_SYNCOBJ;
+		sync.handle = syncobj_create(fd, 0);
+	}
+
+	vm = xe_vm_create(fd, preempt_mode ? DRM_XE_VM_CREATE_FLAG_LR_MODE : 0, 0);
+	bo_size = xe_bb_size(fd, sizeof(struct xe_spin));
+
+	for (i = 0; i < NUM_QUEUES; i++) {
+		bo[i] = xe_bo_create(fd, vm, bo_size, vram_if_possible(fd, eci[0].gt_id),
+				     DRM_XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM);
+		spin[i] = xe_bo_map(fd, bo[i], bo_size);
+		exec_queues[i] = xe_exec_queue_create(fd, vm, eci, ext);
+		if (i == 0)
+			multi_queue.value = exec_queues[i];
+
+		addr[i] = BASE_ADDRESS + i * bo_size;
+	}
+
+	if (preempt_mode)
+		sync.addr = to_user_pointer(&vm_sync);
+
+	for (i = 0; i < NUM_QUEUES; i++) {
+		xe_vm_bind_async(fd, vm, 0, bo[i], 0, addr[i], bo_size, &sync, 1);
+		if (preempt_mode) {
+			xe_wait_ufence(fd, &vm_sync, USER_FENCE_VALUE, 0, fence_timeout);
+			vm_sync = 0;
+		} else {
+			igt_assert(syncobj_wait(fd, &sync.handle, 1, INT64_MAX, 0, NULL));
+			syncobj_reset(fd, &sync.handle, 1);
+		}
+	}
+
+	/* Validate job submission on secondary queue before primary queue */
+	for (i = NUM_QUEUES - 1; i >= 0; i--) {
+		xe_spin_init_opts(spin[i], .addr = addr[i]);
+		if (preempt_mode)
+			sync.addr = addr[i] + (char *)&spin[i]->exec_sync - (char *)spin[i];
+
+		exec.exec_queue_id = exec_queues[i];
+		exec.address = addr[i];
+		xe_exec(fd, &exec);
+		xe_spin_wait_started(spin[i]);
+		xe_spin_end(spin[i]);
+		if (preempt_mode) {
+			xe_wait_ufence(fd, &spin[i]->exec_sync, USER_FENCE_VALUE, exec_queues[i], fence_timeout);
+		} else {
+			igt_assert(syncobj_wait(fd, &sync.handle, 1, INT64_MAX, 0, NULL));
+			syncobj_reset(fd, &sync.handle, 1);
+		}
+	}
+
+	/* Destroy primary queue */
+	xe_exec_queue_destroy(fd, exec_queues[0]);
+
+	/* Validate submission on secondary queues fail after destroying the primary */
+	xe_spin_init_opts(spin[1], .addr = addr[1]);
+	if (preempt_mode)
+		sync.addr = addr[1] + (char *)&spin[1]->exec_sync - (char *)spin[1];
+
+	exec.exec_queue_id = exec_queues[1];
+	exec.address = addr[1];
+	igt_assert_eq(__xe_exec(fd, &exec), -ECANCELED);
+
+	if (preempt_mode)
+		sync.addr = to_user_pointer(&vm_sync);
+
+	for (i = 0; i < NUM_QUEUES; i++) {
+		xe_vm_unbind_async(fd, vm, 0, 0, addr[i], bo_size, &sync, 1);
+		if (preempt_mode) {
+			xe_wait_ufence(fd, &vm_sync, USER_FENCE_VALUE, 0, fence_timeout);
+			vm_sync = 0;
+		} else {
+			igt_assert(syncobj_wait(fd, &sync.handle, 1, INT64_MAX, 0, NULL));
+			syncobj_reset(fd, &sync.handle, 1);
+		}
+	}
+
+	/* Destroy secondary queue */
+	xe_exec_queue_destroy(fd, exec_queues[1]);
+
+	for (i = 0; i < NUM_QUEUES; i++) {
+		munmap(spin[i], bo_size);
+		gem_close(fd, bo[i]);
+	}
+
+	if (!preempt_mode)
+		syncobj_destroy(fd, sync.handle);
+
+	xe_vm_destroy(fd, vm);
+}
+
+/**
+ * SUBTEST: exec-sanity
+ * Description: Run exec submission sanity tests
+ * Test category: functionality test
+ */
+static void
+test_exec_sanity(int fd, struct drm_xe_engine_class_instance *eci)
+{
+	__test_exec_sanity(fd, eci, 0);
+	__test_exec_sanity(fd, eci, PREEMPT_MODE);
+}
+
+static void
+__test_priority(int fd, struct drm_xe_engine_class_instance *eci,
+		unsigned int flags)
+{
+#define USER_FENCE_VALUE	0xdeadbeefdeadbeefull
+	struct drm_xe_sync sync = {
+		.type = DRM_XE_SYNC_TYPE_USER_FENCE,
+		.flags = DRM_XE_SYNC_FLAG_SIGNAL,
+		.timeline_value = USER_FENCE_VALUE,
+	};
+	struct drm_xe_exec exec = {
+		.num_batch_buffer = 1,
+		.num_syncs = 1,
+		.syncs = to_user_pointer(&sync),
+	};
+	uint64_t vm_sync = 0, addr = BASE_ADDRESS;
+	uint32_t exec_queues[XE_EXEC_QUEUE_PRIORITY_N + 1];
+	struct xe_spin *spin[XE_EXEC_QUEUE_PRIORITY_N + 1];
+	uint32_t vm, num_queues, num_queue_priorities, bo = 0;
+	uint32_t start_order[XE_EXEC_QUEUE_PRIORITY_N] = { 0 };
+	int64_t fence_timeout = NSEC_PER_SEC;
+	size_t bo_size;
+	/*
+	 * Q1 - Q6 are used for the priority test.
+	 * Q Priority = id % 3
+	 * 	QID	Q1 Q2 Q3 Q4 Q5 Q6
+	 * Priority	 1  2  0  1  2  0
+	 * The HW treats priority 1 and 0 the same, so it should
+	 * pick Q with priority: Q2, Q5, Q1, Q3, Q4, Q6.
+	 */
+	int expect_order[] = {0,2,5,1,3,4,6};
+	uint32_t already_in_order = 0;		// bitmask to record Q started info
+	struct drm_xe_ext_set_property multi_queue = {
+		.base.name = DRM_XE_EXEC_QUEUE_EXTENSION_SET_PROPERTY,
+		.property = DRM_XE_EXEC_QUEUE_SET_PROPERTY_MULTI_GROUP,
+		.value = DRM_XE_MULTI_GROUP_CREATE,
+	};
+	uint64_t ext = to_user_pointer(&multi_queue);
+	int i, j;
+	void *bo_map;
+
+	num_queue_priorities = XE_EXEC_QUEUE_NUM_PRIORITIES;
+	num_queues = num_queue_priorities * 2 + 1;
+	igt_assert(num_queues <= XE_EXEC_QUEUE_PRIORITY_N);
+	igt_assert(num_queues <= sizeof(uint32_t) * 8);
+
+	igt_debug("%s flags 0x%x eci %d:%d:%d\n", __func__, flags, eci[0].gt_id,
+		 eci[0].engine_class, eci[0].engine_instance);
+
+	vm = xe_vm_create(fd, DRM_XE_VM_CREATE_FLAG_LR_MODE, 0);
+	bo_size = xe_bb_size(fd, sizeof(*spin[0]) * (num_queues + 1));
+
+	bo = xe_bo_create(fd, vm, bo_size, vram_if_possible(fd, eci[0].gt_id),
+			  DRM_XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM);
+	bo_map = xe_bo_map(fd, bo, bo_size);
+	for (i = 0; i < num_queues + 1; i++)
+		spin[i] = bo_map + i * sizeof(*spin[0]);
+
+	/* Use the default priority for Q0 because we are explicitly waiting for it below */
+	exec_queues[0] = xe_exec_queue_create(fd, vm, eci, ext);
+	multi_queue.value = exec_queues[0];
+
+	if (flags & DYN_PRIORITY) {
+		for (i = 1; i < num_queues; i++)
+			exec_queues[i] = xe_exec_queue_create(fd, vm, eci, ext);
+		/*
+		 * Create an extra queue in the same multi-queue group, used as
+		 * a barrier to confirm priority updates have taken effect.
+		 */
+		exec_queues[num_queues] = xe_exec_queue_create(fd, vm, eci, ext);
+	} else {
+		struct drm_xe_ext_set_property mq_priority = {
+			.base.name = DRM_XE_EXEC_QUEUE_EXTENSION_SET_PROPERTY,
+			.property = DRM_XE_EXEC_QUEUE_SET_PROPERTY_MULTI_QUEUE_PRIORITY,
+		};
+
+		multi_queue.base.next_extension = to_user_pointer(&mq_priority);
+
+		/* Create secondary queues with increasing order of priority */
+		for (i = 1; i < num_queues; i++) {
+			mq_priority.value = i % num_queue_priorities;
+			exec_queues[i] = xe_exec_queue_create(fd, vm, eci, ext);
+		}
+	}
+
+	sync.addr = to_user_pointer(&vm_sync);
+	xe_vm_bind_async(fd, vm, 0, bo, 0, addr, bo_size, &sync, 1);
+
+	xe_wait_ufence(fd, &vm_sync, USER_FENCE_VALUE, 0, fence_timeout);
+	vm_sync = 0;
+
+	for (i = 0; i < num_queues; i++) {
+		uint64_t spin_addr = addr + i * sizeof(struct xe_spin);
+
+		xe_spin_init_opts(spin[i], .addr = spin_addr, .multi_queue_switch_on_wait = true,
+				  .write_timestamp = true);
+		/*
+		 * Pre-set all spinners to preempt-wait so each queue, once
+		 * scheduled, immediately blocks at the QUEUE_SWITCH_MODE semaphore
+		 * after writing its timestamp. The HW switches between queues at
+		 * this point, allowing all of them to schedule deterministically.
+		 */
+		xe_spin_preempt_wait(spin[i]);
+		sync.addr = spin_addr + (char *)&spin[i]->exec_sync - (char *)spin[i];
+		exec.exec_queue_id = exec_queues[i];
+		exec.address = spin_addr;
+		xe_exec(fd, &exec);
+	}
+
+	/* Wait for all queues to start and write timestamp */
+	for (i = 0; i < num_queues; i++)
+		while (!READ_ONCE(spin[i]->timestamp));
+
+	if (flags & DYN_PRIORITY) {
+		uint64_t barrier_spin_addr = addr + num_queues * sizeof(struct xe_spin);
+
+		/* Assign increasing order of priority for secondary queues */
+		for (i = 1; i < num_queues; i++)
+			xe_exec_queue_set_property(fd, exec_queues[i],
+						   DRM_XE_EXEC_QUEUE_SET_PROPERTY_MULTI_QUEUE_PRIORITY,
+						   i % num_queue_priorities);
+
+		/*
+		 * Submit a barrier job on the extra queue to ensure priority
+		 * updates have taken effect before releasing the other queues.
+		 */
+		xe_spin_init_opts(spin[num_queues], .addr = barrier_spin_addr);
+		sync.addr = barrier_spin_addr +
+			((char *)&spin[num_queues]->exec_sync - (char *)spin[num_queues]);
+		exec.exec_queue_id = exec_queues[num_queues];
+		exec.address = barrier_spin_addr;
+		xe_exec(fd, &exec);
+		xe_spin_end(spin[num_queues]);
+		xe_wait_ufence(fd, &spin[num_queues]->exec_sync, USER_FENCE_VALUE,
+			       exec_queues[num_queues], fence_timeout);
+	}
+
+	/*
+	 * Clear timestamps and release all queues from the semaphore wait.
+	 * The order in which they next write a timestamp reveals the
+	 * priority-based scheduling order.
+	 */
+	for (i = 0; i < num_queues; i++) {
+		WRITE_ONCE(spin[i]->timestamp, 0);
+		xe_spin_preempt_nowait(spin[i]);
+
+		/*
+		 * For Q0, wait until it is running again to ensure it holds the engine
+		 * when priority arbitration is triggered.
+		 */
+		if (!i)
+			while (!READ_ONCE(spin[i]->timestamp));
+	}
+
+	/*
+	 * Sleep to allow xe_spin_preempt_nowait() to become visible to the GPU
+	 * for other queues before checking if they have been scheduled.
+	 */
+	usleep(10);
+
+	/*
+	 * Verify that secondary queues have not been scheduled while Q0
+	 * holds the engine.
+	 */
+	for (i = 1; i < num_queues; i++)
+		igt_assert(!READ_ONCE(spin[i]->timestamp));
+
+	/*
+	 * Trigger a queue switch by making the spinner on q0 to wait on preempt
+	 * condition, allowing job on q1 to get scheduled and finish. When we end
+	 * the spin[0], it triggers the CFEG to perform a queue priority arbitration
+	 * rather than a full context switch out. Consequently, in both semaphore
+	 * (WAIT_MODE) and non-semaphore scenarios, a priority check will occur.
+	 */
+	if (flags & WAIT_MODE)
+		xe_spin_preempt_wait(spin[0]);
+	else
+		xe_spin_end(spin[0]);
+
+	/* Wait for jobs to get scheduled */
+	i = 1;
+	while (i < num_queues) {
+		for (j = 1; j < num_queues; j++) {
+			if (READ_ONCE(spin[j]->timestamp) && ((already_in_order & (1 << j)) == 0)) {
+				start_order[i] = j;
+				xe_spin_end(spin[j]);
+				xe_wait_ufence(fd, &spin[j]->exec_sync, USER_FENCE_VALUE,
+					       exec_queues[j], fence_timeout);
+				already_in_order |= (1 << j);
+				i++;
+			}
+		}
+	}
+
+	/* While ending spinner on q0, bring it out of preempt wait */
+	if (flags & WAIT_MODE) {
+		xe_spin_end(spin[0]);
+		xe_spin_preempt_nowait(spin[0]);
+	}
+	xe_wait_ufence(fd, &spin[0]->exec_sync, USER_FENCE_VALUE, exec_queues[0], fence_timeout);
+
+	igt_debug("Order\t Actual\t Expect\n");
+	for (i = 1, j = 0; i < num_queues; i++) {
+		igt_debug("  %d\t  Q%d(%d)\t  Q%d(%d)\n",i, start_order[i], start_order[i] % num_queue_priorities,
+                         expect_order[i], expect_order[i] % num_queue_priorities);
+
+		/* The priority 0, 1 are the same, so we can skip the comparison */
+		if (expect_order[i] % num_queue_priorities < XE_EXEC_QUEUE_PRIORITY_HIGH &&
+		    start_order[i] % num_queue_priorities < XE_EXEC_QUEUE_PRIORITY_HIGH)
+			continue;
+
+		if (start_order[i] % num_queue_priorities != expect_order[i] % num_queue_priorities)
+			j++;
+	}
+
+	/* There should be no out of order execution */
+	igt_assert(j == 0);
+
+	sync.addr = to_user_pointer(&vm_sync);
+	xe_vm_unbind_async(fd, vm, 0, 0, addr, bo_size, &sync, 1);
+	xe_wait_ufence(fd, &vm_sync, USER_FENCE_VALUE, 0, fence_timeout);
+
+	for (i = 0; i < num_queues; i++)
+		xe_exec_queue_destroy(fd, exec_queues[i]);
+
+	/* Destroy the extra queue */
+	if (flags & DYN_PRIORITY)
+		xe_exec_queue_destroy(fd, exec_queues[num_queues]);
+
+	munmap(bo_map, bo_size);
+	gem_close(fd, bo);
+
+	xe_vm_destroy(fd, vm);
+}
+
+/**
+ * SUBTEST: priority
+ * Description: Validate queue priority setting
+ * Test category: functionality test
+ */
+static void
+test_priority(int fd, struct drm_xe_engine_class_instance *eci)
+{
+	__test_priority(fd, eci, 0);
+	__test_priority(fd, eci, WAIT_MODE);
+	__test_priority(fd, eci, DYN_PRIORITY);
+	__test_priority(fd, eci, DYN_PRIORITY | WAIT_MODE);
+}
+
+static void
+test_preempt_mode(int fd, struct drm_xe_engine_class_instance *eci, int num_placement,
+		  int n_exec_queues, int n_execs, unsigned int flags)
+{
+#define USER_FENCE_VALUE	0xdeadbeefdeadbeefull
+	struct drm_xe_sync sync = {
+		.type = DRM_XE_SYNC_TYPE_USER_FENCE,
+		.flags = DRM_XE_SYNC_FLAG_SIGNAL,
+		.timeline_value = USER_FENCE_VALUE,
+	};
+	struct drm_xe_exec exec = {
+		.num_batch_buffer = 1,
+		.num_syncs = 1,
+		.syncs = to_user_pointer(&sync),
+	};
+	uint32_t vm;
+	uint64_t addr = BASE_ADDRESS;
+	uint32_t exec_queues[MAX_N_EXEC_QUEUES];
+	int64_t fence_timeout = NSEC_PER_SEC;
+	uint64_t vm_sync = 0;
+	size_t bo_size;
+	uint32_t bo = 0;
+	struct {
+		uint32_t batch[16];
+		uint64_t pad;
+		uint64_t exec_sync;
+		uint32_t data;
+	} *data;
+	int i, b;
+
+	if (flags & CLOSE_FD)
+		fd = drm_open_driver(DRIVER_XE);
+
+	igt_assert(n_exec_queues <= MAX_N_EXEC_QUEUES);
+	if (flags & FAULT_MODE)
+		vm = xe_vm_create(fd, DRM_XE_VM_CREATE_FLAG_LR_MODE |
+				  DRM_XE_VM_CREATE_FLAG_FAULT_MODE, 0);
+	else
+		vm = xe_vm_create(fd, DRM_XE_VM_CREATE_FLAG_LR_MODE, 0);
+
+	bo_size = xe_bb_size(fd, sizeof(*data) * n_execs);
+
+	if (flags & USERPTR) {
+#define	MAP_ADDRESS	0x00007fadeadbe000
+		if (flags & INVALIDATE) {
+			data = mmap((void *)MAP_ADDRESS, bo_size, PROT_READ |
+				    PROT_WRITE, MAP_SHARED | MAP_FIXED |
+				    MAP_ANONYMOUS, -1, 0);
+			igt_assert(data != MAP_FAILED);
+		} else {
+			data = aligned_alloc(xe_get_default_alignment(fd), bo_size);
+			igt_assert(data);
+		}
+		memset(data, 0, bo_size);
+	} else {
+		if (flags & SMEM)
+			bo = xe_bo_create(fd, vm, bo_size, system_memory(fd), 0);
+		else
+			bo = xe_bo_create(fd, vm, bo_size, vram_if_possible(fd, eci[0].gt_id),
+					  DRM_XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM);
+		data = xe_bo_map(fd, bo, bo_size);
+	}
+
+	for (i = 0; i < n_exec_queues; i++) {
+		struct drm_xe_ext_set_property multi_queue = {
+			.base.name = DRM_XE_EXEC_QUEUE_EXTENSION_SET_PROPERTY,
+			.property = DRM_XE_EXEC_QUEUE_SET_PROPERTY_MULTI_GROUP,
+		};
+		struct drm_xe_ext_set_property mq_priority = {
+			.base.name = DRM_XE_EXEC_QUEUE_EXTENSION_SET_PROPERTY,
+			.property = DRM_XE_EXEC_QUEUE_SET_PROPERTY_MULTI_QUEUE_PRIORITY,
+		};
+		uint64_t ext = to_user_pointer(&multi_queue);
+
+		if (flags & PRIORITY) {
+			multi_queue.base.next_extension = to_user_pointer(&mq_priority);
+			mq_priority.value = XE_EXEC_QUEUE_PRIORITY_NORMAL + (rand() % 2);
+		}
+
+		multi_queue.value = i ? exec_queues[0] : DRM_XE_MULTI_GROUP_CREATE;
+		igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, num_placement, eci,
+						     ext, &exec_queues[i]), 0);
+	};
+
+	sync.addr = to_user_pointer(&vm_sync);
+	if (bo)
+		xe_vm_bind_async(fd, vm, 0, bo, 0, addr, bo_size, &sync, 1);
+	else
+		xe_vm_bind_userptr_async(fd, vm, 0, to_user_pointer(data),
+					 addr, bo_size, &sync, 1);
+
+	xe_wait_ufence(fd, &vm_sync, USER_FENCE_VALUE, 0, fence_timeout);
+	vm_sync = 0;
+
+	for (i = 0; i < n_execs; i++) {
+		uint64_t batch_offset = (char *)&data[i].batch - (char *)data;
+		uint64_t batch_addr = addr + batch_offset;
+		uint64_t sdi_offset = (char *)&data[i].data - (char *)data;
+		uint64_t sdi_addr = addr + sdi_offset;
+		int e = i % n_exec_queues;
+
+		b = 0;
+		data[i].batch[b++] = MI_STORE_DWORD_IMM_GEN4;
+		data[i].batch[b++] = sdi_addr;
+		data[i].batch[b++] = sdi_addr >> 32;
+		data[i].batch[b++] = 0xc0ffee;
+		data[i].batch[b++] = MI_BATCH_BUFFER_END;
+		igt_assert(b <= ARRAY_SIZE(data[i].batch));
+
+		sync.addr = addr + (char *)&data[i].exec_sync - (char *)data;
+
+		exec.exec_queue_id = exec_queues[e];
+		exec.address = batch_addr;
+
+		if (flags & DYN_PRIORITY)
+			xe_exec_queue_set_property(fd, exec_queues[e],
+						   DRM_XE_EXEC_QUEUE_SET_PROPERTY_MULTI_QUEUE_PRIORITY,
+						   XE_EXEC_QUEUE_PRIORITY_NORMAL + (rand() % 2));
+
+		xe_exec(fd, &exec);
+
+		if (flags & INVALIDATE) {
+			/*
+			 * Wait for exec completion and check data as userptr will
+			 * likely change to different physical memory on next mmap
+			 * call triggering an invalidate.
+			 */
+			xe_wait_ufence(fd, &data[i].exec_sync,
+				       USER_FENCE_VALUE, exec_queues[e],
+				       fence_timeout);
+			igt_assert_eq(data[i].data, 0xc0ffee);
+
+			data = mmap((void *)MAP_ADDRESS, bo_size, PROT_READ |
+				    PROT_WRITE, MAP_SHARED | MAP_FIXED |
+				    MAP_ANONYMOUS, -1, 0);
+			igt_assert(data != MAP_FAILED);
+		}
+	}
+
+	if (!(flags & INVALIDATE))
+		for (i = 0; i < n_execs; i++)
+			xe_wait_ufence(fd, &data[i].exec_sync, USER_FENCE_VALUE,
+				       exec_queues[i % n_exec_queues], fence_timeout);
+
+	sync.addr = to_user_pointer(&vm_sync);
+	xe_vm_unbind_async(fd, vm, 0, 0, addr, bo_size, &sync, 1);
+	xe_wait_ufence(fd, &vm_sync, USER_FENCE_VALUE, 0, fence_timeout);
+
+	if (!(flags & INVALIDATE))
+		for (i = 0; i < n_execs; i++)
+			igt_assert_eq(data[i].data, 0xc0ffee);
+
+	if (!(flags & CLOSE_FD))
+		for (i = 0; i < n_exec_queues; i++)
+			xe_exec_queue_destroy(fd, exec_queues[i]);
+
+	if (bo) {
+		munmap(data, bo_size);
+		gem_close(fd, bo);
+	} else if (!(flags & INVALIDATE)) {
+		free(data);
+	}
+
+	if (!(flags & CLOSE_FD))
+		xe_vm_destroy(fd, vm);
+	else
+		drm_close_driver(fd);
+}
+
+static void
+test_legacy_mode(int fd, struct drm_xe_engine_class_instance *eci, int num_placement,
+		 int n_exec_queues, int n_execs, unsigned int flags)
+{
+	struct drm_xe_sync sync[2] = {
+		{ .flags = DRM_XE_SYNC_TYPE_SYNCOBJ | DRM_XE_SYNC_FLAG_SIGNAL, },
+		{ .flags = DRM_XE_SYNC_TYPE_SYNCOBJ | DRM_XE_SYNC_FLAG_SIGNAL, },
+	};
+
+	struct drm_xe_exec exec = {
+		.num_batch_buffer = 1,
+		.num_syncs = 2,
+		.syncs = to_user_pointer(sync),
+	};
+	uint32_t vm;
+	uint64_t addr = BASE_ADDRESS;
+	uint32_t exec_queues[MAX_N_EXEC_QUEUES];
+	uint32_t syncobjs[MAX_N_EXEC_QUEUES];
+	uint32_t bind_syncobj;
+	size_t bo_size;
+	uint32_t bo = 0;
+	struct {
+		uint32_t batch[16];
+		uint64_t pad;
+		uint32_t data;
+	} *data;
+	int i, b;
+
+	if (flags & CLOSE_FD)
+		fd = drm_open_driver(DRIVER_XE);
+
+	igt_assert(n_exec_queues <= MAX_N_EXEC_QUEUES);
+	vm = xe_vm_create(fd, 0, 0);
+	bo_size = xe_bb_size(fd, sizeof(*data) * n_execs);
+
+	if (flags & USERPTR) {
+#define	MAP_ADDRESS	0x00007fadeadbe000
+		if (flags & INVALIDATE) {
+			data = mmap((void *)MAP_ADDRESS, bo_size, PROT_READ |
+				    PROT_WRITE, MAP_SHARED | MAP_FIXED |
+				    MAP_ANONYMOUS, -1, 0);
+			igt_assert(data != MAP_FAILED);
+		} else {
+			data = aligned_alloc(xe_get_default_alignment(fd), bo_size);
+			igt_assert(data);
+		}
+		memset(data, 0, bo_size);
+	} else {
+		if (flags & SMEM)
+			bo = xe_bo_create(fd, vm, bo_size, system_memory(fd), 0);
+		else
+			bo = xe_bo_create(fd, vm, bo_size, vram_if_possible(fd, eci[0].gt_id),
+					  DRM_XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM);
+		data = xe_bo_map(fd, bo, bo_size);
+	}
+
+	for (i = 0; i < n_exec_queues; i++) {
+		struct drm_xe_ext_set_property multi_queue = {
+			.base.name = DRM_XE_EXEC_QUEUE_EXTENSION_SET_PROPERTY,
+			.property = DRM_XE_EXEC_QUEUE_SET_PROPERTY_MULTI_GROUP,
+		};
+		struct drm_xe_ext_set_property mq_priority = {
+			.base.name = DRM_XE_EXEC_QUEUE_EXTENSION_SET_PROPERTY,
+			.property = DRM_XE_EXEC_QUEUE_SET_PROPERTY_MULTI_QUEUE_PRIORITY,
+		};
+		uint64_t ext = to_user_pointer(&multi_queue);
+
+		if (flags & PRIORITY) {
+			multi_queue.base.next_extension = to_user_pointer(&mq_priority);
+			mq_priority.value = XE_EXEC_QUEUE_PRIORITY_NORMAL + (rand() % 2);
+		}
+
+		multi_queue.value = i ? exec_queues[0] : DRM_XE_MULTI_GROUP_CREATE;
+		igt_assert_eq(__xe_exec_queue_create(fd, vm, 1, num_placement, eci,
+						     ext, &exec_queues[i]), 0);
+
+		syncobjs[i] = syncobj_create(fd, 0);
+	};
+
+	bind_syncobj = syncobj_create(fd, 0);
+	sync[0].handle = bind_syncobj;
+	if (bo)
+		xe_vm_bind_async(fd, vm, 0, bo, 0, addr, bo_size, sync, 1);
+	else
+		xe_vm_bind_userptr_async(fd, vm, 0, to_user_pointer(data),
+					 addr, bo_size, sync, 1);
+
+	for (i = 0; i < n_execs; i++) {
+		uint64_t batch_offset = (char *)&data[i].batch - (char *)data;
+		uint64_t batch_addr = addr + batch_offset;
+		uint64_t sdi_offset = (char *)&data[i].data - (char *)data;
+		uint64_t sdi_addr = addr + sdi_offset;
+		int e = i % n_exec_queues;
+
+		b = 0;
+		data[i].batch[b++] = MI_STORE_DWORD_IMM_GEN4;
+		data[i].batch[b++] = sdi_addr;
+		data[i].batch[b++] = sdi_addr >> 32;
+		data[i].batch[b++] = 0xc0ffee;
+		data[i].batch[b++] = MI_BATCH_BUFFER_END;
+		igt_assert(b <= ARRAY_SIZE(data[i].batch));
+
+		sync[0].flags &= ~DRM_XE_SYNC_FLAG_SIGNAL;
+		sync[0].handle = bind_syncobj;
+		sync[1].flags |= DRM_XE_SYNC_FLAG_SIGNAL;
+		sync[1].handle = syncobjs[e];
+
+		exec.exec_queue_id = exec_queues[e];
+		exec.address = batch_addr;
+		if (e != i)
+			syncobj_reset(fd, &syncobjs[e], 1);
+
+		if (flags & DYN_PRIORITY)
+			xe_exec_queue_set_property(fd, exec_queues[e],
+						   DRM_XE_EXEC_QUEUE_SET_PROPERTY_MULTI_QUEUE_PRIORITY,
+						   XE_EXEC_QUEUE_PRIORITY_NORMAL + (rand() % 2));
+
+		xe_exec(fd, &exec);
+
+		if (flags & INVALIDATE) {
+			/*
+			 * Wait for exec completion and check data as userptr will
+			 * likely change to different physical memory on next mmap
+			 * call triggering an invalidate.
+			 */
+			igt_assert(syncobj_wait(fd, &syncobjs[e], 1,
+						INT64_MAX, 0, NULL));
+			igt_assert_eq(data[i].data, 0xc0ffee);
+
+			data = mmap((void *)MAP_ADDRESS, bo_size, PROT_READ |
+				    PROT_WRITE, MAP_SHARED | MAP_FIXED |
+				    MAP_ANONYMOUS, -1, 0);
+			igt_assert(data != MAP_FAILED);
+		}
+	}
+
+	if (!(flags & INVALIDATE))
+		for (i = 0; i < n_exec_queues && i < n_execs; i++)
+			igt_assert(syncobj_wait(fd, &syncobjs[i], 1, INT64_MAX, 0, NULL));
+
+	igt_assert(syncobj_wait(fd, &bind_syncobj, 1, INT64_MAX, 0, NULL));
+	sync[0].flags |= DRM_XE_SYNC_FLAG_SIGNAL;
+	syncobj_reset(fd, &sync[0].handle, 1);
+	xe_vm_unbind_async(fd, vm, 0, 0, addr, bo_size, sync, 1);
+	igt_assert(syncobj_wait(fd, &sync[0].handle, 1,	INT64_MAX, 0, NULL));
+
+	if (!(flags & INVALIDATE))
+		for (i = 0; i < n_execs; i++)
+			igt_assert_eq(data[i].data, 0xc0ffee);
+
+	for (i = 0; i < n_exec_queues; i++) {
+		syncobj_destroy(fd, syncobjs[i]);
+		if (!(flags & CLOSE_FD))
+			xe_exec_queue_destroy(fd, exec_queues[i]);
+	}
+
+	if (bo) {
+		munmap(data, bo_size);
+		gem_close(fd, bo);
+	} else if (!(flags & INVALIDATE)) {
+		free(data);
+	}
+
+	syncobj_destroy(fd, bind_syncobj);
+
+	if (!(flags & CLOSE_FD))
+		xe_vm_destroy(fd, vm);
+	else
+		drm_close_driver(fd);
+}
+
+/**
+ * SUBTEST: one-queue-%s
+ * Description: Run %arg[1] test with one exec queue
+ * Test category: functionality test
+ *
+ * SUBTEST: two-queues-%s
+ * Description: Run %arg[1] test with two exec queues
+ * Test category: functionality test
+ *
+ * SUBTEST: many-queues-%s
+ * Description: Run %arg[1] test with many exec queues
+ * Test category: stress test
+ *
+ * SUBTEST: max-queues-%s
+ * Description: Run %arg[1] test with max exec queues
+ * Test category: stress test
+ *
+ * SUBTEST: many-execs-%s
+ * Description: Run %arg[1] test with many exec submissions per exec queue
+ * Test category: functionality test
+ *
+ * SUBTEST: few-execs-%s
+ * Description: Run %arg[1] test with exec submissions only on few exec queues
+ * Test category: functionality test
+ *
+ * arg[1]:
+ *
+ * @basic:					basic
+ * @basic-smem:					basic smem
+ * @userptr:					userptr
+ * @userptr-invalidate:				userptr invalidate
+ * @priority:					priority
+ * @close-fd:					close fd without destroying exec queues
+ * @dyn-priority:				dynamic priority
+ * @preempt-mode-basic:				preempt-mode basic
+ * @priority-smem:				priority smem
+ * @close-fd-smem:				close fd without destroying exec queues smem
+ * @dyn-priority-smem:				dynamic priority smem
+ * @preempt-mode-basic-smem:			preempt-mode basic smem
+ * @preempt-mode-userptr:			preempt-mode userptr
+ * @preempt-mode-userptr-invalidate:		preempt-mode userptr invalidate
+ * @preempt-mode-priority:			preempt-mode priority
+ * @preempt-mode-close-fd:			preempt-mode close fd without destroying exec queues
+ * @preempt-mode-dyn-priority:			preempt-mode dynamic priority
+ * @preempt-mode-fault-basic:			preempt-mode-fault-mode basic
+ * @preempt-mode-priority-smem:			preempt-mode priority smem
+ * @preempt-mode-close-fd-smem:			preempt-mode close fd without destroying exec queues smem
+ * @preempt-mode-dyn-priority-smem:		preempt-mode dynamic priority smem
+ * @preempt-mode-fault-basic-smem:		preempt-mode-fault-mode basic smem
+ * @preempt-mode-fault-userptr:			preempt-mode-fault-mode userptr
+ * @preempt-mode-fault-userptr-invalidate:	preempt-mode-fault-mode userptr invalidate
+ * @preempt-mode-fault-priority:		preempt-mode-fault-mode priority
+ * @preempt-mode-fault-close-fd:		preempt-mode-fault-mode close fd
+ * @preempt-mode-fault-dyn-priority:		preempt-mode-fault-mode dynamic priority
+ * @preempt-mode-fault-priority-smem:		preempt-mode-fault-mode priority smem
+ * @preempt-mode-fault-close-fd-smem:		preempt-mode-fault-mode close fd smem
+ * @preempt-mode-fault-dyn-priority-smem:	preempt-mode-fault-mode dynamic priority smem
+ *
+ */
+static void
+test_exec(int fd, struct drm_xe_engine_class_instance *eci, int num_placement,
+	  int n_exec_queues, int n_execs, unsigned int flags)
+{
+	if (flags & PREEMPT_MODE)
+		test_preempt_mode(fd, eci, num_placement, n_exec_queues, n_execs, flags);
+	else
+		test_legacy_mode(fd, eci, num_placement, n_exec_queues, n_execs, flags);
+}
+
+/**
+ * SUBTEST: virtual
+ * Description: Validate virtual queues with multiple placements
+ * Test category: functionality test
+ */
+static void
+test_exec_virtual(int fd, int gt, int class)
+{
+	struct drm_xe_engine_class_instance eci[MAX_INSTANCE];
+	struct drm_xe_engine_class_instance *hwe;
+	int n = 0;
+
+	xe_for_each_engine(fd, hwe) {
+		if (hwe->engine_class != class || hwe->gt_id != gt)
+			continue;
+
+		eci[n++] = *hwe;
+	}
+
+	if (!n)
+		return;
+
+	test_exec(fd, eci, n, n, n, 0);
+	test_exec(fd, eci, n, n, n, PREEMPT_MODE);
+}
+
+int igt_main()
+{
+	struct drm_xe_engine_class_instance *hwe;
+	const struct section {
+		const char *name;
+		unsigned int flags;
+	} sections[] = {
+		{ "basic", 0 },
+		{ "basic-smem", SMEM },
+		{ "userptr", USERPTR },
+		{ "userptr-invalidate", USERPTR | INVALIDATE },
+		{ "priority", PRIORITY },
+		{ "priority-smem", PRIORITY | SMEM },
+		{ "close-fd", CLOSE_FD },
+		{ "close-fd-smem", CLOSE_FD | SMEM },
+		{ "dyn-priority", DYN_PRIORITY },
+		{ "dyn-priority-smem", DYN_PRIORITY | SMEM },
+		{ "preempt-mode-basic", PREEMPT_MODE },
+		{ "preempt-mode-basic-smem", PREEMPT_MODE | SMEM },
+		{ "preempt-mode-userptr", PREEMPT_MODE | USERPTR },
+		{ "preempt-mode-userptr-invalidate", PREEMPT_MODE | USERPTR | INVALIDATE },
+		{ "preempt-mode-priority", PREEMPT_MODE | PRIORITY },
+		{ "preempt-mode-priority-smem", PREEMPT_MODE | PRIORITY | SMEM },
+		{ "preempt-mode-close-fd", PREEMPT_MODE | CLOSE_FD },
+		{ "preempt-mode-close-fd-smem", PREEMPT_MODE | CLOSE_FD | SMEM },
+		{ "preempt-mode-dyn-priority", PREEMPT_MODE | DYN_PRIORITY },
+		{ "preempt-mode-dyn-priority-smem", PREEMPT_MODE | DYN_PRIORITY | SMEM },
+		{ "preempt-mode-fault-basic", PREEMPT_MODE | FAULT_MODE },
+		{ "preempt-mode-fault-basic-smem", PREEMPT_MODE | FAULT_MODE | SMEM },
+		{ "preempt-mode-fault-userptr", PREEMPT_MODE | FAULT_MODE | USERPTR },
+		{ "preempt-mode-fault-userptr-invalidate", PREEMPT_MODE | FAULT_MODE |
+			USERPTR | INVALIDATE },
+		{ "preempt-mode-fault-priority", PREEMPT_MODE | FAULT_MODE | PRIORITY },
+		{ "preempt-mode-fault-priority-smem", PREEMPT_MODE | FAULT_MODE | PRIORITY | SMEM },
+		{ "preempt-mode-fault-close-fd", PREEMPT_MODE | FAULT_MODE | CLOSE_FD },
+		{ "preempt-mode-fault-close-fd-smem", PREEMPT_MODE | FAULT_MODE | CLOSE_FD | SMEM },
+		{ "preempt-mode-fault-dyn-priority", PREEMPT_MODE | FAULT_MODE | DYN_PRIORITY },
+		{ "preempt-mode-fault-dyn-priority-smem", PREEMPT_MODE | FAULT_MODE | DYN_PRIORITY | SMEM },
+		{ NULL },
+	};
+	int fd, gt, class;
+
+	igt_fixture() {
+		fd = drm_open_driver(DRIVER_XE);
+		igt_require(xe_has_multi_queue_engine(fd));
+	}
+
+	igt_subtest_f("sanity")
+		xe_for_each_gt(fd, gt)
+			xe_for_each_multi_queue_engine_class(fd, class)
+				test_sanity(fd, gt, class);
+
+	igt_subtest_f("exec-sanity")
+		xe_for_each_multi_queue_engine(fd, hwe)
+			test_exec_sanity(fd, hwe);
+
+	igt_subtest_f("virtual")
+		xe_for_each_gt(fd, gt)
+			xe_for_each_multi_queue_engine_class(fd, class)
+				test_exec_virtual(fd, gt, class);
+
+	igt_subtest_f("priority")
+		xe_for_each_multi_queue_engine(fd, hwe)
+			test_priority(fd, hwe);
+
+	for (const struct section *s = sections; s->name; s++) {
+		igt_subtest_f("one-queue-%s", s->name)
+			xe_for_each_multi_queue_engine(fd, hwe)
+				test_exec(fd, hwe, 1, 1, 1, s->flags);
+
+		igt_subtest_f("two-queues-%s", s->name)
+			xe_for_each_multi_queue_engine(fd, hwe)
+				test_exec(fd, hwe, 1, 2, 2, s->flags);
+
+		igt_subtest_f("many-queues-%s", s->name)
+			xe_for_each_multi_queue_engine(fd, hwe)
+				test_exec(fd, hwe, 1, 16, 16, s->flags);
+
+		igt_subtest_f("max-queues-%s", s->name)
+			xe_for_each_multi_queue_engine(fd, hwe)
+				test_exec(fd, hwe, 1, MAX_N_EXEC_QUEUES,
+					  MAX_N_EXEC_QUEUES, s->flags);
+
+		igt_subtest_f("many-execs-%s", s->name)
+			xe_for_each_multi_queue_engine(fd, hwe)
+				test_exec(fd, hwe, 1, 16, 64, s->flags);
+
+		igt_subtest_f("few-execs-%s", s->name)
+			xe_for_each_multi_queue_engine(fd, hwe)
+				test_exec(fd, hwe, 1, 16, 8, s->flags);
+	}
+
+	igt_fixture()
+		drm_close_driver(fd);
+}

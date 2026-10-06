@@ -1,0 +1,381 @@
+/*
+ * Copyright © 2015 Intel Corporation
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ * Authors:
+ *   Ander Conselvan de Oliveira <ander.conselvan.de.oliveira@intel.com>
+ */
+
+/**
+ * TEST: kms pipe b c ivb
+ * Category: Display
+ * Description: Exercise the FDI lane bifurcation code for IVB in the kernel by
+ *              setting different combinations of modes for pipes B and C.
+ * Driver requirement: i915
+ * Mega feature: General Display Features
+ */
+
+#include "igt.h"
+
+/**
+ * SUBTEST: disable-pipe-B-enable-pipe-C
+ * Description: Tests pipe-B and pipe-C interactions in IVB by disabling pipe-B
+ *              and then setting mode on pipe-C.
+ *
+ * SUBTEST: enable-pipe-C-while-B-has-3-lanes
+ * Description: Tests pipe-B and pipe-C interactions in IVB by enabling pipe-C
+ *              while pipe-B has 3-lanes
+ *
+ * SUBTEST: from-pipe-C-to-B-with-3-lanes
+ * Description: Tests pipe-B and pipe-C interactions in IVB by enabling pipe-B
+ *              with 3 lanes from pipe-C.
+ *
+ * SUBTEST: pipe-B-double-modeset-then-modeset-pipe-C
+ * Description: Tests pipe-B and pipe-C interactions in IVB by enabling two
+ *              different modes on pipe-B and then a single mode on pipe-C.
+ *
+ * SUBTEST: pipe-B-dpms-off-modeset-pipe-C
+ * Description: Tests pipe-B and pipe-C interactions in IVB by enabling pipe-B
+ *              with mode that requires 3 lanes and then enabling pipe-c with
+ *              dpms off/on pipe-B.
+ */
+
+IGT_TEST_DESCRIPTION(
+"Exercise the FDI lane bifurcation code for IVB in the kernel by setting"
+"different combinations of modes for pipes B and C.");
+
+typedef struct {
+	int drm_fd;
+	igt_display_t display;
+	igt_crtc_t *crtc_b;
+	igt_crtc_t *crtc_c;
+} data_t;
+
+drmModeModeInfo mode_3_lanes = {
+	.clock = 173000,
+	.hdisplay = 1920,
+	.hsync_start = 2048,
+	.hsync_end = 2248,
+	.htotal = 2576,
+	.vdisplay = 1080,
+	.vsync_start = 1083,
+	.vsync_end = 1088,
+	.vtotal = 1120,
+	.vrefresh = 60,
+	.flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_PVSYNC,
+	.name = "3_lanes",
+};
+
+drmModeModeInfo mode_2_lanes = {
+	.clock = 138500,
+	.hdisplay = 1920,
+	.hsync_start = 1968,
+	.hsync_end = 2000,
+	.htotal = 2080,
+	.vdisplay = 1080,
+	.vsync_start = 1083,
+	.vsync_end = 1088,
+	.vtotal = 1111,
+	.vrefresh = 60,
+	.flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NVSYNC,
+	.name = "2_lanes",
+};
+
+static int
+disable_crtc(data_t *data, igt_crtc_t *crtc, igt_output_t *output)
+{
+	igt_plane_t *primary;
+
+	igt_output_set_crtc(output, crtc);
+	primary = igt_output_get_plane(output, 0);
+	igt_plane_set_fb(primary, NULL);
+	return igt_display_commit(&data->display);
+}
+
+static int
+set_mode_on_crtc(data_t *data, igt_crtc_t *crtc, igt_output_t *output)
+{
+	igt_plane_t *primary;
+	drmModeModeInfo *mode;
+	struct igt_fb fb;
+	int fb_id;
+
+	igt_output_set_crtc(output, crtc);
+
+	mode = igt_output_get_mode(output);
+
+	primary = igt_output_get_plane(output, 0);
+
+	fb_id = igt_create_color_fb(data->drm_fd,
+				    mode->hdisplay, mode->vdisplay,
+				    DRM_FORMAT_XRGB8888, DRM_FORMAT_MOD_LINEAR,
+				    1.0, 1.0, 1.0, &fb);
+	igt_assert_lte(0, fb_id);
+
+	igt_plane_set_fb(primary, &fb);
+	return igt_display_try_commit2(&data->display, COMMIT_LEGACY);
+}
+
+static int
+set_big_mode_on_crtc(data_t *data, igt_crtc_t *crtc, igt_output_t *output)
+{
+	igt_output_override_mode(output, &mode_3_lanes);
+	return set_mode_on_crtc(data, crtc,
+				output);
+}
+
+static int
+set_normal_mode_on_crtc(data_t *data, igt_crtc_t *crtc, igt_output_t *output)
+{
+	igt_output_override_mode(output, &mode_2_lanes);
+	return set_mode_on_crtc(data, crtc,
+				output);
+}
+
+static void
+find_outputs(data_t *data, igt_output_t **output1, igt_output_t **output2)
+{
+	igt_output_t *output;
+	igt_crtc_t *crtc;
+
+	*output1 = NULL;
+	*output2 = NULL;
+
+	for_each_crtc_with_valid_output(&data->display, crtc, output) {
+		if (crtc->pipe == PIPE_B && !*output1 && output != *output2)
+			*output1 = output;
+
+		if (crtc->pipe == PIPE_C && output != *output1 && !*output2)
+			*output2 = output;
+
+		igt_output_set_crtc(output, NULL);
+	}
+
+	igt_skip_on_f(!*output1 || !*output2, "Not enough connected outputs\n");
+}
+
+static void
+test_dpms(data_t *data)
+{
+	igt_crtc_t *crtc_b = data->crtc_b;
+	igt_crtc_t *crtc_c = data->crtc_c;
+	igt_output_t *output1, *output2;
+	int ret;
+
+	igt_display_reset(&data->display);
+	find_outputs(data, &output1, &output2);
+
+	igt_info("Pipe %s will use connector %s\n",
+		 igt_crtc_name(crtc_b), igt_output_name(output1));
+	igt_info("Pipe %s will use connector %s\n",
+		 igt_crtc_name(crtc_c), igt_output_name(output2));
+
+	ret = set_big_mode_on_crtc(data,
+				   crtc_b,
+				   output1);
+	igt_assert_eq(ret, 0);
+
+	kmstest_set_connector_dpms(data->drm_fd, output1->config.connector, DRM_MODE_DPMS_OFF);
+
+	ret = set_big_mode_on_crtc(data,
+				   crtc_c,
+				   output2);
+	igt_assert_neq(ret, 0);
+}
+
+static void
+test_lane_reduction(data_t *data)
+{
+	igt_crtc_t *crtc_b = data->crtc_b;
+	igt_crtc_t *crtc_c = data->crtc_c;
+	igt_output_t *output1, *output2;
+	int ret;
+
+	igt_display_reset(&data->display);
+
+	find_outputs(data, &output1, &output2);
+
+	igt_info("Pipe %s will use connector %s\n",
+		 igt_crtc_name(crtc_b), igt_output_name(output1));
+	igt_info("Pipe %s will use connector %s\n",
+		 igt_crtc_name(crtc_c), igt_output_name(output2));
+
+	ret = set_big_mode_on_crtc(data,
+				   crtc_b,
+				   output1);
+	igt_assert_eq(ret, 0);
+
+	ret = set_normal_mode_on_crtc(data,
+				      crtc_b,
+				      output1);
+	igt_assert_eq(ret, 0);
+
+	ret = set_normal_mode_on_crtc(data,
+				      crtc_c,
+				      output2);
+	igt_assert_eq(ret, 0);
+}
+
+static void
+test_disable_pipe_B(data_t *data)
+{
+	igt_crtc_t *crtc_b = data->crtc_b;
+	igt_crtc_t *crtc_c = data->crtc_c;
+	igt_output_t *output1, *output2;
+	int ret;
+
+	igt_display_reset(&data->display);
+	find_outputs(data, &output1, &output2);
+
+	igt_info("Pipe %s will use connector %s\n",
+		 igt_crtc_name(crtc_b), igt_output_name(output1));
+	igt_info("Pipe %s will use connector %s\n",
+		 igt_crtc_name(crtc_c), igt_output_name(output2));
+
+	ret = set_big_mode_on_crtc(data,
+				   crtc_b,
+				   output1);
+	igt_assert_eq(ret, 0);
+
+	ret = disable_crtc(data, crtc_b,
+			   output1);
+	igt_assert_eq(ret, 0);
+
+	ret = set_normal_mode_on_crtc(data,
+				      crtc_c,
+				      output2);
+	igt_assert_eq(ret, 0);
+
+	ret = set_normal_mode_on_crtc(data,
+				      crtc_b,
+				      output1);
+	igt_assert_eq(ret, 0);
+}
+
+static void
+test_from_C_to_B_with_3_lanes(data_t *data)
+{
+	igt_crtc_t *crtc_b = data->crtc_b;
+	igt_crtc_t *crtc_c = data->crtc_c;
+	igt_output_t *output1, *output2;
+	int ret;
+
+	igt_display_reset(&data->display);
+	find_outputs(data, &output1, &output2);
+
+	igt_info("Pipe %s will use connector %s\n",
+		 igt_crtc_name(crtc_b), igt_output_name(output1));
+	igt_info("Pipe %s will use connector %s\n",
+		 igt_crtc_name(crtc_c), igt_output_name(output2));
+
+	ret = set_normal_mode_on_crtc(data,
+				      crtc_c,
+				      output2);
+	igt_assert_eq(ret, 0);
+
+	ret = disable_crtc(data, crtc_c,
+			   output2);
+	igt_assert_eq(ret, 0);
+
+	ret = set_big_mode_on_crtc(data,
+				   crtc_b,
+				   output1);
+	igt_assert_eq(ret, 0);
+}
+
+static void
+test_fail_enable_pipe_C_while_B_has_3_lanes(data_t *data)
+{
+	igt_crtc_t *crtc_b = data->crtc_b;
+	igt_crtc_t *crtc_c = data->crtc_c;
+	igt_output_t *output1, *output2;
+	int ret;
+
+	igt_display_reset(&data->display);
+	find_outputs(data, &output1, &output2);
+
+	igt_info("Pipe %s will use connector %s\n",
+		 igt_crtc_name(crtc_b), igt_output_name(output1));
+	igt_info("Pipe %s will use connector %s\n",
+		 igt_crtc_name(crtc_c), igt_output_name(output2));
+
+	ret = set_big_mode_on_crtc(data,
+				   crtc_b,
+				   output1);
+	igt_assert_eq(ret, 0);
+
+	ret = set_normal_mode_on_crtc(data,
+				      crtc_c,
+				      output2);
+	igt_assert_neq(ret, 0);
+}
+
+static data_t data;
+int igt_main()
+{
+	int devid;
+
+	igt_fixture() {
+		data.drm_fd = drm_open_driver_master(DRIVER_INTEL);
+		devid = intel_get_drm_devid(data.drm_fd);
+		igt_skip_on(!IS_IVYBRIDGE(devid));
+
+		kmstest_set_vt_graphics_mode();
+		igt_display_require(&data.display, data.drm_fd);
+		igt_display_require_output(&data.display);
+
+		data.crtc_b = igt_crtc_for_pipe(&data.display, PIPE_B);
+		igt_skip_on(!data.crtc_b);
+
+		data.crtc_c = igt_crtc_for_pipe(&data.display, PIPE_C);
+		igt_skip_on(!data.crtc_c);
+	}
+
+	igt_describe("Tests pipe-B and pipe-C interactions in IVB by enabling pipe-B with mode "
+		     "that requires 3 lanes and then enabling pipe-c with dpms off/on pipe-B.");
+	igt_subtest("pipe-B-dpms-off-modeset-pipe-C")
+		test_dpms(&data);
+
+	igt_describe("Tests pipe-B and pipe-C interactions in IVB by enabling 2 different modes "
+		     "on pipe-B and then a single mode on pipe-C.");
+	igt_subtest("pipe-B-double-modeset-then-modeset-pipe-C")
+		test_lane_reduction(&data);
+
+	igt_describe("Tests pipe-B and pipe-C interactions in IVB by disabling pipe-B and then "
+		     "setting mode on pipe-C.");
+	igt_subtest("disable-pipe-B-enable-pipe-C")
+		test_disable_pipe_B(&data);
+
+	igt_describe("Tests pipe-B and pipe-C interactions in IVB by enabling pipe-B with 3 lanes "
+		     "from pipe-C.");
+	igt_subtest("from-pipe-C-to-B-with-3-lanes")
+		test_from_C_to_B_with_3_lanes(&data);
+
+	igt_describe("Tests pipe-B and pipe-C interactions in IVB by enabling pipe-C while pipe-B "
+		     "has 3-lanes");
+	igt_subtest("enable-pipe-C-while-B-has-3-lanes")
+		test_fail_enable_pipe_C_while_B_has_3_lanes(&data);
+
+	igt_fixture() {
+		igt_display_fini(&data.display);
+		drm_close_driver(data.drm_fd);
+	}
+}

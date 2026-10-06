@@ -1,0 +1,146 @@
+###############################################
+igt@meta_test(@.*)?
+##################################################################
+# Non-Intel driver tests
+##################################################################
+igt@amdgpu.*
+igt@asahi.*
+igt@msm.*
+igt@nouveau_.*
+igt@panfrost.*
+igt@panthor.*
+igt@v3d.*
+igt@vc4.*
+igt@vgem_.*
+igt@.*virtgpu.*
+igt@vkms.*
+igt@vmwgfx.*
+##################################################################
+# Exclude all i915 tests
+##################################################################
+igt@api.*
+igt@gem.*
+igt@gen.*
+igt@i915_.*
+igt@perf.*
+igt@sysfs_.*
+igt@.*@i915.*
+##################################################################
+# Exclude mock DRM KUnit from IGT, as those already run at build
+# time on Intel CI
+#################################################################
+igt@dmabuf.*
+igt@drm_buddy
+igt@drm_mm
+igt@kms_selftest.*
+##################################################################
+# Exclude slow KUnit test which should run as manual test
+##################################################################
+igt@xe_live_ktest@xe_bo_shrink
+##################################################################
+# Exclude all other non-Xe tests
+##################################################################
+igt@debugfs.*
+igt@device_reset@.*cold.*
+igt@device_reset@.*reset-bound
+igt@drm_read.*
+igt@dumb.*
+igt@prime_.*
+igt@sw_sync.*
+igt@syncobj_.*
+igt@template.*
+igt@tools_test.*
+##################################################################
+# KMS: Pipe E to Pipe P are not available on Intel hardware,
+# hence can't use more than 4 displays.
+##################################################################
+igt@.*@.*pipe-[e-pE-P]($|-.*)
+igt@kms_bw@.*-([5-9]|1[0-6])-displays-.*
+##################################################################
+# KMS: Tests specific to i915 driver
+##################################################################
+igt@kms_addfb_basic@addfb25-x-tiled-mismatch-legacy
+igt@kms_addfb_basic@basic-y-tiled-legacy
+igt@kms_addfb_basic@bo-too-small-due-to-tiling
+igt@kms_addfb_basic@clobberred-modifier
+igt@kms_addfb_basic@.*framebuffer-vs-set-tiling
+igt@kms_addfb_basic@tile-pitch-mismatch
+igt@kms_busy@.*
+igt@kms_cursor_legacy@basic-busy-flip-before-cursor-(atomic|legacy|varying-size)
+igt@kms_draw_crc@draw-method-(mmap-cpu|mmap-gtt|pwrite)
+igt@kms_fence_pin_leak
+igt@kms_flip@.*flip-vs-fences.*
+igt@kms_force_connector_basic@force-load-detect
+igt@kms_frontbuffer_tracking@.*-(cpu|gtt|pwrite)
+igt@kms_legacy_colorkey@.*
+igt@kms_pipe_b_c_ivb@.*
+igt@kms_psr@.*-mmap-(cpu|gtt)
+igt@kms_pwrite_crc
+igt@kms_rotation_crc@exhaust-fences
+igt@kms_pm_lpsp@screens-disabled
+igt@kms_pm_rpm@(fences|fences-dpms|pm-caching|pm-tiling)
+igt@kms_pm_rpm@.*pc8-residency.*
+igt@kms_pm_rpm@cursor.*
+igt@kms_psr@.*cursor-(render|blt)
+##################################################################
+# KMS: Yet to add/missing XE support
+##################################################################
+igt@kms_atomic@plane-primary-overlay-mutable-zpos
+igt@kms_plane_scaling@.*downscale-factor-0-25.*
+igt@kms_prime@.*
+igt@kms_scaling_modes@scaling-mode-none
+igt@kms_writeback@writeback.*
+igt@kms_colorop@.*
+##################################################################
+# KMS: Test was written with the idea that edid read shouldn't take an
+# unreasonable amount of time. The timeout is an arbitrary value
+# because it depends on when the display responds and, in some cases,
+# especially when the display is coming back from sleep, it can take
+# quite a while. This test has sporadic behavior across various
+# platforms connected to different displays.
+##################################################################
+igt@kms_sysfs_edid_timing
+##################################################################
+# KMS: Non-Intel tests
+##################################################################
+igt@kms_cursor_legacy@modeset-atomic-cursor-hotspot
+igt@kms_async_flips@overlay-atomic
+##################################################################
+# SR-IOV tests too stressful or time-consuming
+# to execute all dynamic subtests at once.
+##################################################################
+igt@sriov_basic@enable-vfs-autoprobe-on$
+igt@sriov_basic@enable-vfs-bind-unbind-each$
+igt@sriov_basic@bind-unbind-vf$
+##################################################################
+# Chamelium V1 HDMI receiver supports a maximum resolution
+# of 4K @ 30Hz. This test enforces an EDID with 4K @ 60Hz,
+# which exceeds the capabilities of V1 hardware and results
+# in failures. Temporarily blocklist this test until V3 Chamelium
+# boards (which support 4K @ 60Hz) are available in the test environment.
+##################################################################
+igt@kms_chamelium_edid@hdmi-edid-stress-resolution-4k
+##################################################################
+# Exclude one compute mode test
+##################################################################
+igt@xe_exec_compute_mode@non-blocking
+##################################################################
+# Async flips with linear modifier are slower
+##################################################################
+igt@kms_async_flips@async-flip-with-page-flip-events-linear.*
+##################################################################
+# Remove VGA-related subtests from the Xe chamelium testlist as Xe
+# driver does not support VGA connector types.
+##################################################################
+igt@kms_chamelium.*@.*vga.*
+###############################################
+# Tends to generate invalid configurations
+# using CCS planes or configurations that
+# exceed HW capabilities resulting in sporadic
+# failure with -EINVAL.
+#
+# Maintaining extra constraints for Intel's HW
+# is too costly in comparison to the value
+# provided.
+###############################################
+igt@kms_chamelium_frames@hdmi-.*-planes-random

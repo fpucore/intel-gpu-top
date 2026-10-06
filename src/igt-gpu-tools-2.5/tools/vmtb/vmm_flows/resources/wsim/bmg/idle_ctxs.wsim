@@ -1,0 +1,22 @@
+###############################################################
+# VF S/R scenario: idle migration with contexts created
+#
+# 1. Run 3ms pre-migration WL on each engine
+# 2. Wait 20s for migration to happen
+# 3. Run the WLs again in post-migration phase to check fixups
+#
+# BMG variant - engines:
+# Root tile: RCS, BCS, CCS
+# Media tile: VCS, VECS
+###############################################################
+1.RCS.3000.0.0
+1.BCS.3000.0.0
+1.CCS.3000.0.1
+1.VCS.3000.0.0
+1.VECS.3000.0.0
+d.20000000
+1.RCS.3000.0.0
+1.BCS.3000.0.0
+1.CCS.3000.0.1
+1.VCS.3000.0.0
+1.VECS.3000.0.0

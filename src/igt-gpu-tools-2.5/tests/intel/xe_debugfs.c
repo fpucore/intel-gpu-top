@@ -1,0 +1,655 @@
+// SPDX-License-Identifier: MIT
+/*
+ * Copyright © 2025 Intel Corporation
+ */
+
+#include <dirent.h>
+#include <fcntl.h>
+
+#include "igt.h"
+#include "igt_debugfs.h"
+#include "igt_dir.h"
+#include "igt_sysfs.h"
+#include "xe/xe_query.h"
+
+struct {
+	bool warn_on_not_hit;
+} opt = { 0 };
+
+/**
+ * TEST: Xe debugfs test
+ * Description: Xe-specific debugfs tests. These are complementary to the
+ * core_debugfs and core_debugfs_display_on_off tests.
+ *
+ * Category: Core
+ * Mega feature: General Core features
+ * Sub-category: uapi
+ * Functionality: debugfs
+ * Feature: core
+ * Test category: uapi
+ *
+ * SUBTEST: check-gt-reg-sr
+ * Description: Check the reg_sr list associated with GTs for missing reg values
+ */
+
+IGT_TEST_DESCRIPTION("Validate Xe debugfs devnodes and their contents");
+
+#define for_each_set_bit(__i, __mask)		\
+	for (unsigned int __m = (__mask);		\
+	__m && ((__i) = __builtin_ctz(__m), 1);	\
+	__m &= __m - 1)
+
+/* Validation types for debugfs read tests */
+enum debugfs_validate_type {
+	VALIDATE_NONE,		/* Just check file exists */
+	VALIDATE_NON_EMPTY,	/* Just check buffer is not empty */
+	VALIDATE_CONTAINS_STR,	/* Check buffer contains expected string */
+	VALIDATE_INT_GE_ZERO,	/* Parse as integer, verify >= 0 */
+	VALIDATE_BOOL,		/* Check bool value (0 or 1) */
+};
+
+struct check_entry {
+	const char *name_fmt;
+	int mode;
+	bool (*condition)(struct xe_device *xe_dev);
+	unsigned int (*iter_mask)(struct xe_device *xe_dev);
+	bool optional;
+	enum debugfs_validate_type validate;
+	const char *expected_str;
+};
+
+static unsigned int gt_iter_mask(struct xe_device *xe_dev)
+{
+	return xe_dev->gt_mask;
+}
+
+static unsigned int tile_iter_mask(struct xe_device *xe_dev)
+{
+	return xe_dev->tile_mask;
+}
+
+static bool has_vram(struct xe_device *xe_dev)
+{
+	return xe_dev->has_vram;
+}
+
+/* Validate the format of debugfs fmt file, allow only one %u literal */
+static bool validate_debugfs_fmt(const char *fmt)
+{
+	bool found_u = false;
+
+	for (const char *p = fmt; *p; p++) {
+		if (*p != '%')
+			continue;
+
+		/* % at end of string → invalid */
+		if (!p[1])
+			return false;
+
+		/* must be exactly %u */
+		if (p[1] != 'u')
+			return false;
+
+		/* only one %u allowed */
+		if (found_u)
+			return false;
+
+		found_u = true;
+
+		/* skip u */
+		p++; /* caller loop increments p again */
+	}
+
+	return found_u;
+}
+
+struct hit_entry {
+	struct igt_list_head link;
+	char name[64];
+};
+
+static bool find_not_tested_files(int dir_fd, struct igt_list_head *hit_entries)
+{
+	igt_dir_file_list_t *file_list_entry;
+	bool found_not_tested = false;
+	igt_dir_t *dir = igt_dir_create(dir_fd);
+	int ret;
+
+	igt_assert_f(dir, "Failed to create igt_dir_t for debugfs dir\n");
+
+	ret = igt_dir_scan_dirfd(dir, 0);
+	igt_assert_f(ret == 0, "Failed to scan debugfs directory\n");
+
+
+	igt_list_for_each_entry(file_list_entry, &dir->file_list_head, link) {
+		struct hit_entry *e;
+		bool hit = false;
+
+		igt_list_for_each_entry(e, hit_entries, link) {
+			if (strcmp(file_list_entry->relative_path, e->name) == 0) {
+				hit = true;
+				break;
+			}
+		}
+
+		if (!hit) {
+			igt_warn("No test for: %s\n", file_list_entry->relative_path);
+			found_not_tested = true;
+		}
+	}
+
+	igt_dir_destroy(dir);
+
+	return found_not_tested;
+}
+
+/* Validate that debugfs buffer is non-empty or contains expected string */
+static bool validate_string(int dirfd, const char *file_name, const char *expected_str)
+{
+	char buf[4096];
+	int ret = 0;
+
+	ret = igt_sysfs_read(dirfd, file_name, buf, sizeof(buf) - 1);
+	if (ret < 0)
+		return false;
+	buf[ret] = '\0';
+
+	/* Check for empty buffer */
+	if (strlen(buf) == 0) {
+		igt_info("Empty output from %s\n", file_name);
+		return false;
+	}
+
+	/* If expecting specific string, verify it's present */
+	if (expected_str && !strstr(buf, expected_str)) {
+		igt_info("Expected '%s' not found in %s\n", expected_str, file_name);
+		return false;
+	}
+
+	if (expected_str)
+		igt_info("Successfully read %s: found '%s'\n", file_name, expected_str);
+	else
+		igt_info("Successfully read %s: %zd bytes\n%s\n", file_name, strlen(buf), buf);
+
+	return true;
+}
+
+static const char *mode_to_str(int mode)
+{
+	switch (mode & O_ACCMODE) {
+	case O_RDONLY: return "RO";
+	case O_WRONLY: return "WO";
+	case O_RDWR:   return "RW";
+	default:       return "UNKNOWN";
+	}
+}
+
+static bool validate_bool_file(int dirfd, const char *file_name, int mode)
+{
+	int orig_val = 0, read_val = 0, test_val = 0;
+
+	if (igt_sysfs_scanf(dirfd, file_name, "%d", &orig_val) != 1) {
+		return false;
+	}
+
+	if (orig_val != 0 && orig_val != 1) {
+		igt_info("Unexpected bool value: %d\n", orig_val);
+		return false;
+	}
+
+	if (mode == O_RDWR) {
+		test_val = orig_val ? 0 : 1;
+
+		if (igt_sysfs_printf(dirfd, file_name, "%d", test_val) < 0) {
+			igt_info("Failed to write %d to %s\n", test_val, file_name);
+			return false;
+		}
+
+		if (igt_sysfs_scanf(dirfd, file_name, "%d", &read_val) != 1 || read_val != test_val)
+			return false;
+
+		/* Restore original value */
+		if (igt_sysfs_printf(dirfd, file_name, "%d", orig_val) < 0) {
+			igt_warn("Failed to restore original value for %s\n", file_name);
+			return false;
+		}
+	}
+
+	igt_info("Successfully validated %s bool %s\n", mode_to_str(mode), file_name);
+	return true;
+}
+
+static bool validate_int_file(int dirfd, const char *file_name, int mode)
+{
+	int orig_val = 0, new_val = 0, read_val = 0;
+
+	if (igt_sysfs_scanf(dirfd, file_name, "%d", &orig_val) != 1)
+		return false;
+
+	if (orig_val < 0) {
+		igt_info("Unexpected negative value %d in %s\n", orig_val, file_name);
+		return false;
+	}
+
+	if (mode == O_RDWR) {
+		new_val = orig_val + 1;
+		if (new_val < 0)
+			new_val = orig_val - 1;
+		if (igt_sysfs_printf(dirfd, file_name, "%d", new_val) < 0) {
+			igt_info("Failed to write %d to %s\n", new_val, file_name);
+			return false;
+		}
+		if (igt_sysfs_scanf(dirfd, file_name, "%d", &read_val) != 1)
+			return false;
+		if (read_val != new_val) {
+			igt_info("Unexpected value in %s: expected %d, got %d\n", file_name,
+				 new_val, read_val);
+			return false;
+		}
+		/* Restore original value */
+		if (igt_sysfs_printf(dirfd, file_name, "%d", orig_val) < 0) {
+			igt_warn("Failed to restore original value for %s\n", file_name);
+			return false;
+		}
+
+		igt_info("Successfully validated writing int %s: %d\n",
+			 file_name, new_val);
+	} else {
+		igt_info("Successfully validated reading int %s: %d\n",
+			 file_name, orig_val);
+	}
+	return true;
+}
+
+static bool file_in_dir_exists(int dirfd, const char *file_name, int mode)
+{
+	int fd = openat(dirfd, file_name, mode);
+
+	if (fd >= 0) {
+		close(fd);
+		return true;
+	}
+
+	return false;
+}
+
+static bool validate_debugfs_file(int dirfd, const char *file_name, int mode,
+				  enum debugfs_validate_type validate, const char *expected_str)
+{
+	bool result = true;
+
+	if (validate == VALIDATE_NONE)
+		return true;
+
+	switch (validate) {
+	case VALIDATE_NON_EMPTY:
+		result = validate_string(dirfd, file_name, NULL);
+		break;
+	case VALIDATE_CONTAINS_STR:
+		result = validate_string(dirfd, file_name, expected_str);
+		break;
+	case VALIDATE_INT_GE_ZERO:
+		result = validate_int_file(dirfd, file_name, mode);
+		break;
+	case VALIDATE_BOOL:
+		result = validate_bool_file(dirfd, file_name, mode);
+		break;
+	default:
+		igt_warn("Unknown validate type %d for %s\n", validate, file_name);
+		result = false;
+		break;
+	}
+
+	return result;
+}
+
+/*
+ * Return: negative error code on failure, or number of missing files
+ */
+static int debugfs_validate_entries(struct xe_device *xe_dev, int dir_fd,
+				    const struct check_entry *expected_files, size_t size)
+{
+	struct igt_list_head hit_entries;
+	int missing_count = 0;
+	int fail_count = 0;
+	int err = 0;
+
+	IGT_INIT_LIST_HEAD(&hit_entries);
+
+	for (int i = 0; i < size; i++) {
+		const struct check_entry *check = &expected_files[i];
+		unsigned int mask;
+		unsigned int j;
+
+		if (check->condition && !check->condition(xe_dev))
+			continue;
+
+		if (!check->iter_mask)
+			mask = BIT(0); /* to iterate once */
+		else
+			mask = check->iter_mask(xe_dev);
+
+		for_each_set_bit(j, mask) {
+			struct hit_entry *entry;
+
+			entry = malloc(sizeof(*entry));
+			if (!entry) {
+				igt_warn("Failed to allocate memory for hit entry\n");
+				err = -ENOMEM;
+				goto out;
+			}
+
+			igt_list_add(&entry->link, &hit_entries);
+
+			if (!check->iter_mask) {
+				snprintf(entry->name, sizeof(entry->name), "%s", check->name_fmt);
+			} else {
+				int ret;
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+				/**
+				 * XXX: We ignore the compiler warning, but
+				 * validate fmt at runtime.
+				 */
+				if (!validate_debugfs_fmt(check->name_fmt)) {
+					igt_warn("Invalid debugfs name fmt: %s.\n",
+						 check->name_fmt);
+					err = -EBADF;
+					goto out;
+				}
+
+				ret = snprintf(entry->name, sizeof(entry->name),
+					       check->name_fmt, j);
+				if (ret < 0 || ret >= sizeof(entry->name)) {
+					igt_warn("Debugfs format failed for: %s\n",
+						 check->name_fmt);
+					err = -EINVAL;
+					goto out;
+				}
+#pragma GCC diagnostic pop
+			}
+
+			if (!file_in_dir_exists(dir_fd, entry->name, check->mode)) {
+				if (check->optional) {
+					igt_info("Optional entry %s not found (skipped)\n",
+						 entry->name);
+				} else {
+					igt_info("Missing debugfs file: %s\n",
+						 entry->name);
+					missing_count++;
+				}
+			} else {
+				if (!validate_debugfs_file(dir_fd, entry->name, check->mode,
+							   check->validate, check->expected_str)) {
+					igt_info("Fail at debugfs file: %s\n", entry->name);
+					fail_count++;
+				}
+			}
+
+		}
+	}
+
+	if (opt.warn_on_not_hit)
+		find_not_tested_files(dir_fd, &hit_entries);
+
+out:
+	if (!igt_list_empty(&hit_entries)) {
+		struct hit_entry *entry, *tmp;
+
+		igt_list_for_each_entry_safe(entry, tmp, &hit_entries, link) {
+			igt_list_del(&entry->link);
+			free(entry);
+		}
+	}
+
+	if (fail_count || missing_count)
+		igt_warn("Fails: %d missing debugfs file(s): %d\n", fail_count, missing_count);
+
+	return (err < 0) ? err : (missing_count + fail_count);
+}
+
+/**
+ * SUBTEST: root-dir
+ * Description: Check required debugfs devnodes exist in the root debugfs directory
+ */
+static void test_root_dir(struct xe_device *xe_dev)
+{
+	const struct check_entry expected_files[] = {
+		{ "clients", O_RDONLY, .validate = VALIDATE_NON_EMPTY },
+		{ "disable_late_binding", O_RDWR, .optional = true, .validate = VALIDATE_BOOL },
+		{ "forcewake_all", O_WRONLY },
+		{ "gem_names", O_RDONLY },
+		{ "gt%u", O_RDONLY, NULL, gt_iter_mask }, /* gt0, gt1, ... */
+		{ "gtt_mm", O_RDONLY, .validate = VALIDATE_NON_EMPTY },
+		{ "info", O_RDONLY, .validate = VALIDATE_NON_EMPTY },
+		{ "name", O_RDONLY, .validate = VALIDATE_NON_EMPTY },
+		{ "tile%u", O_RDONLY, NULL, tile_iter_mask }, /* tile0, tile1, ... */
+		{ "poor_man_system_atomic_support", O_RDWR, .optional = true, .validate = VALIDATE_BOOL },
+		{ "dgfx_pkg_residencies", O_RDONLY, .optional = true, .validate = VALIDATE_NON_EMPTY },
+		{ "dgfx_pcie_link_residencies", O_RDONLY, .optional = true, .validate = VALIDATE_CONTAINS_STR, .expected_str = "PCIE LINK" },
+		{ "sriov_info", O_RDONLY, .optional = true, .validate = VALIDATE_NON_EMPTY },
+		{ "workarounds", O_RDONLY, .optional = true, .validate = VALIDATE_NON_EMPTY },
+		{ "atomic_svm_timeslice_ms", O_RDWR, .optional = true, .validate = VALIDATE_INT_GE_ZERO },
+	};
+	int debugfs_fd = igt_debugfs_dir(xe_dev->fd);
+	int missing_count;
+
+	if (debugfs_fd < 0)
+		goto skip;
+
+	missing_count = debugfs_validate_entries(xe_dev, debugfs_fd, expected_files,
+						 ARRAY_SIZE(expected_files));
+
+	close(debugfs_fd);
+
+	igt_fail_on_f(missing_count > 0, "Found %d missing debugfs files (see warnings above)\n",
+		      missing_count);
+
+	return;
+skip:
+	igt_skip("Failed to open debugfs directory\n");
+}
+
+/**
+ * SUBTEST: tile-dir
+ * Description: Check required debugfs devnodes exist in the tile debugfs directory
+ */
+static void test_tile_dir(struct xe_device *xe_dev, uint8_t tile)
+{
+	const struct check_entry expected_files[] = {
+		{ "ggtt", O_RDONLY },
+		{ "sa_info", O_RDONLY },
+		{ "vram_mm", O_RDONLY, has_vram },
+	};
+	int debugfs_fd = igt_debugfs_tile_dir(xe_dev->fd, tile);
+	int missing_count;
+
+	igt_skip_on_f(debugfs_fd < 0, "Failed to open debugfs directory\n");
+
+	missing_count = debugfs_validate_entries(xe_dev, debugfs_fd, expected_files,
+						 ARRAY_SIZE(expected_files));
+
+	close(debugfs_fd);
+
+	igt_fail_on_f(missing_count > 0, "Found %d missing debugfs files (see warnings above)\n",
+		      missing_count);
+}
+
+/**
+ * SUBTEST: info-read
+ * Description: Check info debugfs devnode contents
+ */
+static void test_info_read(struct xe_device *xe_dev)
+{
+	uint16_t devid = intel_get_drm_devid(xe_dev->fd);
+	struct drm_xe_query_config *config;
+	const char *name = "info";
+	bool failed = false;
+	char buf[4096];
+	int val;
+
+	config = xe_config(xe_dev->fd);
+
+	igt_assert_f(config, "Failed to get xe config\n");
+
+	snprintf(buf, sizeof(buf), "devid 0x%llx",
+		 config->info[DRM_XE_QUERY_CONFIG_REV_AND_DEVICE_ID] & 0xffff);
+	if (!igt_debugfs_search(xe_dev->fd, name, buf)) {
+		igt_warn("Missing devid in info debugfs\n");
+		failed = true;
+	}
+
+	snprintf(buf, sizeof(buf), "revid %lld",
+		 config->info[DRM_XE_QUERY_CONFIG_REV_AND_DEVICE_ID] >> 16);
+	if (!igt_debugfs_search(xe_dev->fd, name, buf)) {
+		igt_warn("Missing revid in info debugfs\n");
+		failed = true;
+	}
+
+	snprintf(buf, sizeof(buf),
+		 "is_dgfx %s", config->info[DRM_XE_QUERY_CONFIG_FLAGS] &
+		DRM_XE_QUERY_CONFIG_FLAG_HAS_VRAM ? "yes" : "no");
+	if (!igt_debugfs_search(xe_dev->fd, name, buf)) {
+		igt_warn("Missing is_dgfx in info debugfs\n");
+		failed = true;
+	}
+
+	if (intel_gen(devid) < 20) {
+		val = -1;
+
+		switch (config->info[DRM_XE_QUERY_CONFIG_VA_BITS]) {
+		case 48:
+			val = 3;
+			break;
+		case 57:
+			val = 4;
+			break;
+		default:
+			igt_warn("Unexpected va_bits value: %lld\n",
+				 config->info[DRM_XE_QUERY_CONFIG_VA_BITS]);
+			failed = true;
+			break;
+		}
+
+		if (val != -1) {
+			snprintf(buf, sizeof(buf), "vm_max_level %d", val);
+			if (!igt_debugfs_search(xe_dev->fd, name, buf)) {
+				igt_warn("Missing vm_max_level in info debugfs\n");
+				failed = true;
+			}
+		}
+	}
+
+	snprintf(buf, sizeof(buf), "tile_count %d", xe_sysfs_get_num_tiles(xe_dev->fd));
+	if (!igt_debugfs_search(xe_dev->fd, name, buf)) {
+		igt_warn("Missing tile_count in info debugfs\n");
+		failed = true;
+	}
+
+	igt_fail_on_f(failed, "Some required info debugfs entries are missing\n");
+
+}
+
+/*
+ * A small number of reg_sr programming mismatches are expected and not
+ * indicative of hardware/software problems.
+ */
+static const unsigned long reg_sr_exceptions[] = {
+	/* GUC_INTR_CHICKEN_GUC_REG: GuC takes ownership after initial programming */
+	0xC50C,
+};
+
+static void check_gt_reg_sr(int fd, int gt)
+{
+	char buf[1024];
+	int debugfs_fd;
+	FILE *file;
+	int problems = 0;
+
+	debugfs_fd = igt_debugfs_gt_open(fd, gt, "register-save-restore-check",
+					 O_RDONLY);
+	igt_require(debugfs_fd);
+	file = fdopen(debugfs_fd, "r");
+	while (fgets(buf, sizeof(buf), file) != NULL) {
+		unsigned long offset = strtoul(buf, NULL, 16);
+		bool ok = false;
+
+		for (int ex = 0; ex < ARRAY_SIZE(reg_sr_exceptions); ex++) {
+			if (offset == reg_sr_exceptions[ex]) {
+				igt_info("Mismatch on %#lx is not a problem\n", offset);
+				ok = true;
+				break;
+			}
+		}
+
+		if (!ok) {
+			igt_warn("Mismatch on %#lx, Driver reports: %s", offset, buf);
+			problems++;
+		}
+	}
+
+	fclose(file);
+	close(debugfs_fd);
+
+	igt_assert_eq(problems, 0);
+}
+
+const char *help_str =
+	"  --warn-not-hit|--w\tWarn about devfs nodes that have no tests";
+
+struct option long_options[] = {
+	{ "warn-not-hit", no_argument, NULL, 'w'},
+	{ }
+};
+
+static int opt_handler(int option, int option_index, void *input)
+{
+	switch (option) {
+	case 'w':
+		opt.warn_on_not_hit = true;
+		break;
+	default:
+		return IGT_OPT_HANDLER_ERROR;
+	}
+
+	return IGT_OPT_HANDLER_SUCCESS;
+}
+
+int igt_main_args("", long_options, help_str, opt_handler, NULL)
+{
+	struct xe_device *xe_dev;
+	unsigned int t;
+	int fd = -1, gt;
+
+	igt_fixture() {
+		fd = drm_open_driver_master(DRIVER_XE);
+		xe_dev = xe_device_get(fd);
+		igt_assert_f(xe_dev, "Failed to get xe device\n");
+		kmstest_set_vt_graphics_mode();
+	}
+
+	igt_describe("Check required debugfs devnodes exist in the root debugfs directory.");
+	igt_subtest("root-dir")
+		test_root_dir(xe_dev);
+
+	igt_describe("Check required debugfs devnodes exist in the tile debugfs directory.");
+	igt_subtest_with_dynamic("tile-dir")
+			xe_for_each_tile(fd, t)
+				igt_dynamic_f("tile-%u", t)
+					test_tile_dir(xe_dev, t);
+
+	igt_describe("Check info debugfs devnode contents.");
+	igt_subtest("info-read")
+		test_info_read(xe_dev);
+
+	igt_subtest_with_dynamic("check-gt-reg-sr")
+		xe_for_each_gt(fd, gt)
+			igt_dynamic_f("gt%d", gt)
+				check_gt_reg_sr(fd, gt);
+
+	igt_fixture() {
+		drm_close_driver(fd);
+	}
+
+}

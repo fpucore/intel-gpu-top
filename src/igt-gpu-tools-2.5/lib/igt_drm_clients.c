@@ -1,0 +1,610 @@
+// SPDX-License-Identifier: MIT
+/*
+ * Copyright © 2023 Intel Corporation
+ */
+
+#include <assert.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include "igt_drm_clients.h"
+#include "igt_drm_fdinfo.h"
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(array) (sizeof(array) / sizeof(array[0]))
+#endif
+
+/**
+ * igt_drm_clients_init:
+ * @private_data: private data to store in the struct
+ *
+ * Allocate and initialise the clients structure to be used with further API
+ * calls.
+ */
+struct igt_drm_clients *igt_drm_clients_init(void *private_data)
+{
+	struct igt_drm_clients *clients;
+
+	clients = calloc(1, sizeof(*clients));
+	if (!clients)
+		return NULL;
+
+	clients->private_data = private_data;
+
+	return clients;
+}
+
+static struct igt_drm_client *
+igt_drm_clients_find(struct igt_drm_clients *clients,
+		     enum igt_drm_client_status status,
+		     unsigned int drm_minor, unsigned long id)
+{
+	unsigned int start, num;
+	struct igt_drm_client *c;
+
+	start = status == IGT_DRM_CLIENT_FREE ? clients->active_clients : 0; /* Free block at the end. */
+	num = clients->num_clients - start;
+
+	for (c = &clients->client[start]; num; c++, num--) {
+		if (status != c->status)
+			continue;
+
+		if (status == IGT_DRM_CLIENT_FREE ||
+		    (drm_minor == c->drm_minor && c->id == id))
+			return c;
+	}
+
+	return NULL;
+}
+
+static void
+igt_drm_client_update(struct igt_drm_client *c, unsigned int pid, char *name,
+		      const struct drm_client_fdinfo *info)
+{
+	unsigned int i;
+	int len;
+
+	/* Update client pid if it changed (fd sharing). */
+	if (c->pid != pid) {
+		c->pid = pid;
+		len = snprintf(c->pid_str, sizeof(c->pid_str) - 1, "%u", pid);
+		if (len > c->clients->max_pid_len)
+			c->clients->max_pid_len = len;
+	}
+
+	/* Update client name if it changed (fd sharing). */
+	if (strcmp(c->name, name)) {
+		char *p;
+
+		strncpy(c->name, name, sizeof(c->name) - 1);
+		strncpy(c->print_name, name, sizeof(c->print_name) - 1);
+
+		p = c->print_name;
+		while (*p) {
+			if (!isprint(*p))
+				*p = '*';
+			p++;
+		}
+
+		len = strlen(c->print_name);
+		if (len > c->clients->max_name_len)
+			c->clients->max_name_len = len;
+	}
+
+	/* Engines */
+
+	c->agg_delta_engine_time = 0;
+	c->total_engine_time = 0;
+	c->agg_delta_cycles = 0;
+	c->total_cycles = 0;
+	c->agg_delta_total_cycles = 0;
+	c->total_total_cycles = 0;
+
+	for (i = 0; i <= c->engines->max_engine_id; i++) {
+		assert(i < ARRAY_SIZE(info->engine_time));
+		assert(i < ARRAY_SIZE(info->cycles));
+		assert(i < ARRAY_SIZE(info->total_cycles));
+
+		if (info->utilization_mask & DRM_FDINFO_UTILIZATION_ENGINE_TIME &&
+		    info->engine_time[i] >= c->utilization[i].last_engine_time) {
+			c->utilization_mask |= IGT_DRM_CLIENT_UTILIZATION_ENGINE_TIME;
+			c->total_engine_time += info->engine_time[i];
+			c->utilization[i].delta_engine_time =
+				info->engine_time[i] - c->utilization[i].last_engine_time;
+			c->agg_delta_engine_time += c->utilization[i].delta_engine_time;
+			c->utilization[i].last_engine_time = info->engine_time[i];
+		}
+
+		if (info->utilization_mask & DRM_FDINFO_UTILIZATION_CYCLES &&
+		    info->cycles[i] >= c->utilization[i].last_cycles) {
+			c->utilization_mask |= IGT_DRM_CLIENT_UTILIZATION_CYCLES;
+			c->total_cycles += info->cycles[i];
+			c->utilization[i].delta_cycles =
+				info->cycles[i] - c->utilization[i].last_cycles;
+			c->agg_delta_cycles += c->utilization[i].delta_cycles;
+			c->utilization[i].last_cycles = info->cycles[i];
+		}
+
+		if (info->utilization_mask & DRM_FDINFO_UTILIZATION_TOTAL_CYCLES &&
+		    info->total_cycles[i] >= c->utilization[i].last_total_cycles) {
+			c->utilization_mask |= IGT_DRM_CLIENT_UTILIZATION_TOTAL_CYCLES;
+			c->total_total_cycles += info->total_cycles[i];
+			c->utilization[i].delta_total_cycles =
+				info->total_cycles[i] - c->utilization[i].last_total_cycles;
+			c->agg_delta_total_cycles += c->utilization[i].delta_total_cycles;
+			c->utilization[i].last_total_cycles = info->total_cycles[i];
+		}
+	}
+
+	/* Memory regions */
+	for (i = 0; i <= c->regions->max_region_id; i++) {
+		assert(i < ARRAY_SIZE(info->region_mem));
+
+		c->memory[i] = info->region_mem[i];
+	}
+
+	c->samples++;
+	c->status = IGT_DRM_CLIENT_ALIVE;
+}
+
+static void
+igt_drm_client_add(struct igt_drm_clients *clients,
+		   const struct drm_client_fdinfo *info,
+		   unsigned int pid, char *name, unsigned int drm_minor)
+{
+	struct igt_drm_client *c;
+	unsigned int i;
+
+	assert(!igt_drm_clients_find(clients, IGT_DRM_CLIENT_ALIVE,
+				     drm_minor, info->id));
+
+	c = igt_drm_clients_find(clients, IGT_DRM_CLIENT_FREE, 0, 0);
+	if (!c) {
+		unsigned int idx = clients->num_clients;
+
+		/*
+		 * Grow the array a bit past the current requirement to avoid
+		 * constant reallocation when clients are dynamically appearing
+		 * and disappearing.
+		 */
+		clients->num_clients += (clients->num_clients + 2) / 2;
+		clients->client = realloc(clients->client,
+					  clients->num_clients * sizeof(*c));
+		assert(clients->client);
+
+		c = &clients->client[idx];
+		memset(c, 0, (clients->num_clients - idx) * sizeof(*c));
+	}
+
+	c->id = info->id;
+	c->drm_minor = drm_minor;
+	c->clients = clients;
+
+	/* Engines */
+	c->engines = calloc(1, sizeof(*c->engines));
+	assert(c->engines);
+	c->engines->capacity = calloc(info->last_engine_index + 1,
+				      sizeof(*c->engines->capacity));
+	assert(c->engines->capacity);
+	c->engines->names = calloc(info->last_engine_index + 1,
+				   sizeof(*c->engines->names));
+	assert(c->engines->names);
+
+	for (i = 0; i <= info->last_engine_index; i++) {
+		if (!info->capacity[i])
+			continue;
+
+		c->engines->capacity[i] = info->capacity[i];
+		c->engines->names[i] = strdup(info->names[i]);
+		assert(c->engines->names[i]);
+		c->engines->num_engines++;
+		c->engines->max_engine_id = i;
+	}
+
+	c->utilization = calloc(c->engines->max_engine_id + 1,
+				sizeof(*c->utilization));
+	assert(c->utilization);
+
+	/* Memory regions */
+	c->regions = calloc(1, sizeof(*c->regions));
+	assert(c->regions);
+	c->regions->names = calloc(info->last_region_index + 1,
+				   sizeof(*c->regions->names));
+	assert(c->regions->names);
+
+	for (i = 0; i <= info->last_region_index; i++) {
+		/* Region map is allowed to be sparse. */
+		if (!info->region_names[i][0])
+			continue;
+
+		c->regions->names[i] = strdup(info->region_names[i]);
+		assert(c->regions->names[i]);
+		c->regions->num_regions++;
+		c->regions->max_region_id = i;
+	}
+	c->memory = calloc(c->regions->max_region_id + 1, sizeof(*c->memory));
+	assert(c->memory);
+
+	igt_drm_client_update(c, pid, name, info);
+}
+
+static
+void igt_drm_client_free(struct igt_drm_client *c, bool clear)
+{
+	unsigned int i;
+
+	if (c->engines) {
+		for (i = 0; i <= c->engines->max_engine_id; i++)
+			free(c->engines->names[i]);
+		free(c->engines->capacity);
+		free(c->engines->names);
+	}
+	free(c->engines);
+
+	free(c->utilization);
+
+	if (c->regions) {
+		for (i = 0; i <= c->regions->max_region_id; i++)
+			free(c->regions->names[i]);
+		free(c->regions->names);
+	}
+	free(c->regions);
+
+	free(c->memory);
+
+	if (clear)
+		memset(c, 0, sizeof(*c));
+}
+
+struct sort_context
+{
+	int (*user_cmp)(const void *, const void *, void *);
+};
+
+static int sort_cmp(const void *_a, const void *_b, void *_ctx)
+{
+	const struct sort_context *ctx = _ctx;
+	const struct igt_drm_client *a = _a;
+	const struct igt_drm_client *b = _b;
+	int cmp = b->status - a->status;
+
+	if (cmp == 0)
+		return ctx->user_cmp(_a, _b, _ctx);
+	else
+		return cmp;
+}
+
+/**
+ * igt_drm_clients_sort:
+ * @clients: Previously initialised clients object
+ * @cmp: Client comparison callback
+ *
+ * Sort the clients array according to the passed in comparison callback which
+ * is compatible with the qsort(3) semantics, with the third void * argument
+ * being unused.
+ */
+struct igt_drm_clients *
+igt_drm_clients_sort(struct igt_drm_clients *clients,
+		     int (*cmp)(const void *, const void *, void *))
+{
+	struct sort_context ctx = { .user_cmp = cmp };
+	unsigned int active, free;
+	struct igt_drm_client *c;
+	int tmp;
+
+	if (!clients)
+		return clients;
+
+	/*
+	 * Enforce client->status ordering (active followed by free) by running
+	 * the user provided comparison callback wrapped in the one internal
+	 * to the library.
+	 */
+	qsort_r(clients->client, clients->num_clients, sizeof(*clients->client),
+	      sort_cmp, &ctx);
+
+	/* Trim excessive array space. */
+	active = 0;
+	igt_for_each_drm_client(clients, c, tmp) {
+		if (c->status != IGT_DRM_CLIENT_ALIVE)
+			break; /* Active clients are first in the array. */
+		active++;
+	}
+
+	clients->active_clients = active;
+
+	/* Trim excess free space when clients are exiting. */
+	free = clients->num_clients - active;
+	if (free > clients->num_clients / 2) {
+		active = clients->num_clients - free / 2;
+		if (active != clients->num_clients) {
+			clients->num_clients = active;
+			clients->client = realloc(clients->client,
+						  clients->num_clients *
+						  sizeof(*c));
+		}
+	}
+
+	return clients;
+}
+
+/**
+ * igt_drm_clients_free:
+ * @clients: Previously initialised clients object
+ *
+ * Free all clients and all memory associated with the clients structure.
+ */
+void igt_drm_clients_free(struct igt_drm_clients *clients)
+{
+	struct igt_drm_client *c;
+	unsigned int tmp;
+
+	igt_for_each_drm_client(clients, c, tmp)
+		igt_drm_client_free(c, false);
+
+	free(clients->client);
+	free(clients);
+}
+
+static DIR *opendirat(int at, const char *name)
+{
+	DIR *dir;
+	int fd;
+
+	fd = openat(at, name, O_DIRECTORY);
+	if (fd < 0)
+		return NULL;
+
+	dir = fdopendir(fd);
+	if (!dir)
+		close(fd);
+
+	return dir;
+}
+
+static size_t readat2buf(int at, const char *name, char *buf, const size_t sz)
+{
+	ssize_t count;
+	int fd;
+
+	fd = openat(at, name, O_RDONLY);
+	if (fd <= 0)
+		return 0;
+
+	count = read(fd, buf, sz - 1);
+	close(fd);
+
+	if (count > 0) {
+		buf[count] = 0;
+
+		return count;
+	} else {
+		buf[0] = 0;
+
+		return 0;
+	}
+}
+
+static void get_task_data(int pid_dir, unsigned int *pid, char *task, size_t tasksz)
+{
+	char buf[4096];
+	char *s, *e;
+	size_t len;
+
+	if (!readat2buf(pid_dir, "stat", buf, sizeof(buf)))
+		return;
+
+	s = strchr(buf, '(');
+	e = strchr(s, ')');
+	if (!s || !e)
+		return;
+
+	len = e - ++s;
+	if (!len)
+		return;
+
+	if (len + 1 > tasksz)
+		len = tasksz - 1;
+
+	strncpy(task, s, len);
+	task[len] = 0;
+	*pid = atoi(buf);
+}
+
+
+static bool is_drm_fd(int fd_dir, const char *name, unsigned int *minor)
+{
+	struct stat stat;
+	int ret;
+
+	ret = fstatat(fd_dir, name, &stat, 0);
+
+	if (ret == 0 &&
+	    (stat.st_mode & S_IFMT) == S_IFCHR &&
+	    major(stat.st_rdev) == 226) {
+		*minor = minor(stat.st_rdev);
+		return true;
+	}
+
+	return false;
+}
+
+static void clients_update_max_lengths(struct igt_drm_clients *clients)
+{
+	struct igt_drm_client *c;
+	int tmp;
+
+	clients->max_name_len = 0;
+	clients->max_pid_len = 0;
+
+	igt_for_each_drm_client(clients, c, tmp) {
+		int len;
+
+		if (c->status != IGT_DRM_CLIENT_ALIVE)
+			continue; /* Array not yet sorted by the caller. */
+
+		len = strlen(c->print_name);
+		if (len > clients->max_name_len)
+			clients->max_name_len = len;
+
+		len = strlen(c->pid_str);
+		if (len > clients->max_pid_len)
+			clients->max_pid_len = len;
+	}
+}
+
+/**
+ * igt_drm_clients_scan:
+ * @clients: Previously initialised clients object
+ * @filter_client: Callback for client filtering
+ * @name_map: Array of engine name strings
+ * @map_entries: Number of items in the @name_map array
+ *
+ * Scan all open file descriptors from all processes in order to find all DRM
+ * clients and manage our internal list.
+ *
+ * If @name_map is provided each found engine in the fdinfo struct must
+ * correspond to one of the provided names. In this case the index of the engine
+ * stats tracked in struct igt_drm_client will be tracked under the same index
+ * as the engine name provided.
+ *
+ * If @name_map is not provided engine names will be auto-detected (this is
+ * less performant) and indices will correspond with auto-detected names as
+ * listed int clients->engines->names[].
+ */
+struct igt_drm_clients *
+igt_drm_clients_scan(struct igt_drm_clients *clients,
+		     bool (*filter_client)(const struct igt_drm_clients *,
+					   const struct drm_client_fdinfo *),
+		     const char **name_map, unsigned int map_entries,
+		     const char **region_map, unsigned int region_entries)
+{
+	struct dirent *proc_dent;
+	struct igt_drm_client *c;
+	bool freed = false;
+	DIR *proc_dir;
+	int tmp;
+
+	if (!clients)
+		return clients;
+
+	/*
+	 * First mark all alive clients as 'probe' so we can figure out which
+	 * ones have existed since the previous scan.
+	 */
+	igt_for_each_drm_client(clients, c, tmp) {
+		assert(c->status != IGT_DRM_CLIENT_PROBE);
+		if (c->status == IGT_DRM_CLIENT_ALIVE)
+			c->status = IGT_DRM_CLIENT_PROBE;
+		else
+			break; /* Free block at the end of array. */
+	}
+
+	proc_dir = opendir("/proc");
+	if (!proc_dir)
+		return clients;
+
+	while ((proc_dent = readdir(proc_dir)) != NULL) {
+		unsigned int client_pid = 0, minor = 0;
+		int pid_dir = -1, fd_dir = -1;
+		struct dirent *fdinfo_dent;
+		char client_name[64] = { };
+		DIR *fdinfo_dir = NULL;
+
+		if (proc_dent->d_type != DT_DIR)
+			continue;
+		if (!isdigit(proc_dent->d_name[0]))
+			continue;
+
+		pid_dir = openat(dirfd(proc_dir), proc_dent->d_name,
+				 O_DIRECTORY | O_RDONLY);
+		if (pid_dir < 0)
+			continue;
+
+		fd_dir = openat(pid_dir, "fd", O_DIRECTORY | O_RDONLY);
+		if (fd_dir < 0)
+			goto next;
+
+		fdinfo_dir = opendirat(pid_dir, "fdinfo");
+		if (!fdinfo_dir)
+			goto next;
+
+		while ((fdinfo_dent = readdir(fdinfo_dir)) != NULL) {
+			struct drm_client_fdinfo info = { };
+
+			if (fdinfo_dent->d_type != DT_REG)
+				continue;
+			if (!isdigit(fdinfo_dent->d_name[0]))
+				continue;
+
+			if (!is_drm_fd(fd_dir, fdinfo_dent->d_name, &minor))
+				continue;
+
+			if (!__igt_parse_drm_fdinfo(dirfd(fdinfo_dir),
+						    fdinfo_dent->d_name, &info,
+						    name_map, map_entries,
+						    region_map, region_entries))
+				continue;
+
+			if (filter_client && !filter_client(clients, &info))
+				continue;
+
+			if (igt_drm_clients_find(clients, IGT_DRM_CLIENT_ALIVE,
+						 minor, info.id))
+				continue; /* Skip duplicate fds. */
+
+			if (!client_pid) {
+				get_task_data(pid_dir, &client_pid, client_name,
+					      sizeof(client_name));
+				assert(client_pid > 0);
+			}
+
+			c = igt_drm_clients_find(clients, IGT_DRM_CLIENT_PROBE,
+						 minor, info.id);
+			if (!c)
+				igt_drm_client_add(clients, &info, client_pid,
+						   client_name, minor);
+			else
+				igt_drm_client_update(c, client_pid,
+						      client_name, &info);
+		}
+
+next:
+		if (fdinfo_dir)
+			closedir(fdinfo_dir);
+		if (fd_dir >= 0)
+			close(fd_dir);
+		if (pid_dir >= 0)
+			close(pid_dir);
+	}
+
+	closedir(proc_dir);
+
+	/*
+	 * Clients still in 'probe' status after the scan have exited and need
+	 * to be freed.
+	 */
+	igt_for_each_drm_client(clients, c, tmp) {
+		if (c->status == IGT_DRM_CLIENT_PROBE) {
+			igt_drm_client_free(c, true);
+			freed = true;
+		} else if (c->status == IGT_DRM_CLIENT_FREE) {
+			break;
+		}
+	}
+
+	if (freed)
+		clients_update_max_lengths(clients);
+
+	return clients;
+}

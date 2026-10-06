@@ -1,0 +1,18 @@
+###############################################################
+# VF S/R scenario: short non-preemptable batches
+#
+# 1. Run 5ms non-preempable batches on each engine
+# 2. Emit the workload for 20s (rerun in a loop) - keep executing during the migration.
+#    Use 'gem_wsim -r 4000' that gives: 0.005s * 200 = 1s * 20 = 20s
+# 3. Finish execution in post-migration phase
+#
+# BMG variant - engines:
+# Root tile: RCS, BCS, CCS
+# Media tile: VCS, VECS
+###############################################################
+X.1.0
+1.RCS.5000.0.0
+1.BCS.5000.0.0
+1.CCS.5000.0.1
+1.VCS.5000.0.0
+1.VECS.5000.0.0

@@ -1,0 +1,4 @@
+include pytest.ini
+include vmtb_config.json
+include vmm_flows/resources/vgpu_profiles/*
+recursive-include vmm_flows/resources/wsim *

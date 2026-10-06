@@ -1,0 +1,532 @@
+/*
+ * Copyright © 2013 Intel Corporation
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ *
+ */
+
+/**
+ * TEST: kms pipe crc basic
+ * Category: Display
+ * Description: Tests behaviour of CRC
+ * Driver requirement: i915, xe
+ * Mega feature: General Display Features
+ */
+
+#include "igt.h"
+#include "igt_sysfs.h"
+#include <errno.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include <fcntl.h>
+
+/**
+ * SUBTEST: bad-source
+ * Description: Tests error handling when the bad source is set.
+ *
+ * SUBTEST: read-crc
+ * Description: Test for pipe CRC reads
+ *
+ * SUBTEST: read-crc-frame-sequence
+ * Description: Tests the pipe CRC read and ensure frame sequence
+ *
+ * SUBTEST: nonblocking-crc
+ * Description: Test for O_NONBLOCK CRC reads
+ *
+ * SUBTEST: nonblocking-crc-frame-sequence
+ * Description: Test for O_NONBLOCK CRC reads and ensure frame sequence
+ *
+ * SUBTEST: suspend-read-crc
+ * Description: Suspend test for pipe CRC reads
+ *
+ * SUBTEST: hang-read-crc
+ * Description: Hang test for pipe CRC read
+ */
+
+/**
+ * SUBTEST: compare-crc-sanitycheck-%s
+ * Description: Basic sanity check for CRC mismatches with %arg[1]
+ *
+ * arg[1]:
+ *
+ * @xr24:	XR24 format
+ * @nv12:	NV12 format
+ */
+
+/**
+ * SUBTEST: disable-crc-after-crtc
+ * Description: Check that disabling CRCs on a CRTC after having disabled the
+ *              CRTC does not cause issues.
+ */
+
+static bool extended;
+static int active_crtcs[IGT_MAX_PIPES];
+static uint32_t last_crtc_index;
+
+typedef struct {
+	int drm_fd;
+	int debugfs;
+	igt_display_t display;
+	struct igt_fb fb;
+} data_t;
+
+static struct {
+	double r, g, b;
+	igt_crc_t crc;
+} colors[2] = {
+	{ .r = 0.0, .g = 1.0, .b = 0.0 },
+	{ .r = 0.0, .g = 1.0, .b = 1.0 },
+};
+
+static bool simulation_constraint(igt_crtc_t *crtc)
+{
+	if (igt_run_in_simulation() && !extended &&
+	    crtc->crtc_index != active_crtcs[0] &&
+	    crtc->crtc_index != active_crtcs[last_crtc_index])
+		return true;
+
+	return false;
+}
+
+static void test_bad_source(data_t *data)
+{
+	errno = 0;
+	if (igt_sysfs_set(data->debugfs, "crtc-0/crc/control", "foo")) {
+		igt_assert(openat(data->debugfs, "crtc-0/crc/data", O_WRONLY) == -1);
+		igt_skip_on(errno == EIO);
+	}
+
+	igt_assert_eq(errno, EINVAL);
+}
+
+#define N_CRCS	3
+
+enum {
+	TEST_BASIC = 0,
+	TEST_SEQUENCE = 1 << 0,
+	TEST_NONBLOCK = 1 << 1,
+	TEST_SUSPEND = 1 << 2,
+	TEST_HANG = 1 << 3,
+};
+
+static void test_read_crc(data_t *data, igt_crtc_t *crtc,
+			  igt_output_t *output, unsigned flags)
+{
+	igt_display_t *display = &data->display;
+	igt_plane_t *primary;
+	drmModeModeInfo *mode;
+	igt_crc_t *crcs = NULL;
+	int c, j;
+
+	igt_display_reset(display);
+
+	igt_output_set_crtc(output, crtc);
+	mode = igt_output_get_mode(output);
+
+	primary = igt_output_get_plane_type(output, DRM_PLANE_TYPE_PRIMARY);
+
+	for (c = 0; c < ARRAY_SIZE(colors); c++) {
+		char *crc_str;
+		int n_crcs;
+
+		igt_debug("Clearing the fb with color (%.02lf,%.02lf,%.02lf)\n",
+			  colors[c].r, colors[c].g, colors[c].b);
+
+		igt_create_color_fb(data->drm_fd,
+					mode->hdisplay, mode->vdisplay,
+					DRM_FORMAT_XRGB8888,
+					DRM_FORMAT_MOD_LINEAR,
+					colors[c].r,
+					colors[c].g,
+					colors[c].b,
+					&data->fb);
+
+		igt_plane_set_fb(primary, &data->fb);
+
+		igt_display_commit(display);
+
+		/* wait for N_CRCS vblanks and the corresponding N_CRCS CRCs */
+		if (flags & TEST_NONBLOCK) {
+			igt_pipe_crc_t *pipe_crc;
+
+			pipe_crc = igt_crtc_crc_new_nonblock(crtc,
+							     IGT_PIPE_CRC_SOURCE_AUTO);
+			igt_wait_for_vblank(crtc);
+			igt_pipe_crc_start(pipe_crc);
+
+			igt_wait_for_vblank_count(crtc,
+						  N_CRCS);
+			n_crcs = igt_pipe_crc_get_crcs(pipe_crc, N_CRCS+1, &crcs);
+			igt_pipe_crc_stop(pipe_crc);
+			igt_pipe_crc_free(pipe_crc);
+
+			/* allow a one frame difference */
+			igt_assert_lte(N_CRCS, n_crcs);
+		} else {
+			igt_pipe_crc_t *pipe_crc;
+
+			pipe_crc = igt_crtc_crc_new(crtc,
+						    IGT_PIPE_CRC_SOURCE_AUTO);
+			igt_pipe_crc_start(pipe_crc);
+
+			n_crcs = igt_pipe_crc_get_crcs(pipe_crc, N_CRCS, &crcs);
+
+			igt_pipe_crc_stop(pipe_crc);
+			igt_pipe_crc_free(pipe_crc);
+
+			igt_assert_eq(n_crcs, N_CRCS);
+		}
+
+
+		/*
+		 * save the CRC in colors so it can be compared to the CRC of
+		 * other fbs
+		 */
+		colors[c].crc = crcs[0];
+
+		crc_str = igt_crc_to_string(&crcs[0]);
+		igt_debug("CRC for this fb: %s\n", crc_str);
+		free(crc_str);
+
+		/* and ensure that they'are all equal, we haven't changed the fb */
+		for (j = 0; j < (n_crcs - 1); j++)
+			igt_assert_crc_equal(&crcs[j], &crcs[j + 1]);
+
+		if (flags & TEST_SEQUENCE)
+			for (j = 0; j < (n_crcs - 1); j++)
+				igt_assert_eq(crcs[j].frame + 1, crcs[j + 1].frame);
+
+		free(crcs);
+		igt_remove_fb(data->drm_fd, &data->fb);
+	}
+
+	/* Clean-up */
+	igt_output_set_crtc(output, NULL);
+	igt_plane_set_fb(primary, NULL);
+	igt_display_commit(display);
+}
+
+/*
+ * CRC-sanity test, to make sure there would be no CRC mismatches
+ *
+ * - Create two framebuffers (FB0 & FB1).
+ * - Flip FB0 with the primary plane & collect the CRC as ref CRC.
+ * - Flip FB1 with the primary plane, collect the CRC & compare with
+ *   the ref CRC.
+ *
+ *   No CRC mismatch should happen
+ */
+static void test_compare_crc(data_t *data, igt_crtc_t *crtc,
+			     igt_output_t *output,
+			     uint32_t plane_format)
+{
+	igt_display_t *display = &data->display;
+	igt_plane_t *primary;
+	drmModeModeInfo *mode;
+	igt_crc_t ref_crc, crc;
+	igt_pipe_crc_t *pipe_crc = NULL;
+	struct igt_fb fb0, fb1;
+
+	igt_display_reset(display);
+	igt_output_set_crtc(output, crtc);
+
+	mode = igt_output_get_mode(output);
+
+	primary = igt_output_get_plane_type(output, DRM_PLANE_TYPE_PRIMARY);
+	igt_skip_on(!igt_plane_has_format_mod(primary, plane_format, DRM_FORMAT_MOD_LINEAR));
+
+	igt_create_color_fb(data->drm_fd,
+			mode->hdisplay, mode->vdisplay,
+			DRM_FORMAT_XRGB8888,
+			DRM_FORMAT_MOD_LINEAR,
+			1.0, 1.0, 1.0,
+			&fb0);
+	igt_create_color_fb(data->drm_fd,
+			mode->hdisplay, mode->vdisplay, plane_format,
+			DRM_FORMAT_MOD_LINEAR,
+			1.0, 1.0, 1.0,
+			&fb1);
+
+	/* Flip FB0 with the primary plane & collect the CRC as ref CRC. */
+	igt_plane_set_fb(primary, &fb0);
+	igt_display_commit(display);
+
+	pipe_crc = igt_crtc_crc_new(crtc,
+				    IGT_PIPE_CRC_SOURCE_AUTO);
+	igt_pipe_crc_collect_crc(pipe_crc, &ref_crc);
+
+	/* Flip FB1 with the primary plane & compare the CRC with ref CRC. */
+	igt_plane_set_fb(primary, &fb1);
+	igt_display_commit(display);
+
+	igt_pipe_crc_collect_crc(pipe_crc, &crc);
+	igt_assert_crc_equal(&crc, &ref_crc);
+
+	/* Clean-up */
+	igt_pipe_crc_free(pipe_crc);
+	igt_plane_set_fb(primary, NULL);
+	igt_output_set_crtc(output, NULL);
+	igt_display_commit(display);
+
+	igt_remove_fb(data->drm_fd, &fb0);
+	igt_remove_fb(data->drm_fd, &fb1);
+}
+
+static void test_disable_crc_after_crtc(data_t *data, igt_crtc_t *crtc,
+					igt_output_t *output)
+{
+	igt_display_t *display = &data->display;
+	igt_pipe_crc_t *pipe_crc;
+	drmModeModeInfo *mode;
+	igt_crc_t crc[2];
+	igt_plane_t *primary;
+
+	pipe_crc = igt_crtc_crc_new(crtc,
+				    IGT_PIPE_CRC_SOURCE_AUTO);
+
+	igt_display_reset(display);
+	igt_output_set_crtc(output, crtc);
+
+	mode = igt_output_get_mode(output);
+	igt_create_color_fb(data->drm_fd,
+			    mode->hdisplay, mode->vdisplay,
+			    DRM_FORMAT_XRGB8888,
+			    DRM_FORMAT_MOD_LINEAR,
+			    0.0, 1.0, 0.0, &data->fb);
+
+	primary = igt_output_get_plane_type(output, DRM_PLANE_TYPE_PRIMARY);
+	igt_plane_set_fb(primary, &data->fb);
+	igt_display_commit(display);
+
+	igt_pipe_crc_start(pipe_crc);
+	igt_pipe_crc_get_current(data->drm_fd, pipe_crc, &crc[0]);
+
+	kmstest_set_connector_dpms(data->drm_fd, output->config.connector,
+				   DRM_MODE_DPMS_OFF);
+	igt_pipe_crc_stop(pipe_crc);
+
+	kmstest_set_connector_dpms(data->drm_fd, output->config.connector,
+				   DRM_MODE_DPMS_ON);
+	igt_pipe_crc_collect_crc(pipe_crc, &crc[1]);
+	igt_assert_crc_equal(&crc[0], &crc[1]);
+
+	/* Clean-up */
+	igt_pipe_crc_free(pipe_crc);
+	igt_plane_set_fb(primary, NULL);
+	igt_output_set_crtc(output, NULL);
+	igt_display_commit(display);
+	igt_remove_fb(data->drm_fd, &data->fb);
+}
+
+static bool crtc_output_combo_valid(igt_display_t *display, igt_crtc_t *crtc,
+				    igt_output_t *output)
+{
+	bool ret = true;
+
+	igt_display_reset(display);
+
+	igt_output_set_crtc(output, crtc);
+	if (!intel_pipe_output_combo_valid(display))
+		ret = false;
+	igt_output_set_crtc(output, NULL);
+
+	return ret;
+}
+
+data_t data = {0, };
+
+static int opt_handler(int opt, int opt_index, void *_data)
+{
+	switch (opt) {
+	case 'e':
+		extended = true;
+		break;
+	default:
+		return IGT_OPT_HANDLER_ERROR;
+	}
+
+	return IGT_OPT_HANDLER_SUCCESS;
+}
+
+const char *help_str =
+	"  -e \tExtended tests.\n";
+
+int igt_main_args("e", NULL, help_str, opt_handler, NULL)
+{
+	igt_output_t *output;
+	igt_crtc_t *crtc;
+	struct {
+		const char *name;
+		unsigned flags;
+		const char *desc;
+	} tests[] = {
+		{ "read-crc", TEST_BASIC,
+			"Test for pipe CRC reads." },
+		{ "read-crc-frame-sequence", TEST_SEQUENCE,
+			"Tests the pipe CRC read and ensure frame sequence." },
+		{ "nonblocking-crc", TEST_NONBLOCK,
+			"Test for O_NONBLOCK CRC reads." },
+		{ "nonblocking-crc-frame-sequence", TEST_SEQUENCE | TEST_NONBLOCK,
+			"Test for O_NONBLOCK CRC reads and ensure frame sequence." },
+		{ "suspend-read-crc", TEST_SUSPEND,
+			"Suspend test for pipe CRC reads." },
+		{ "hang-read-crc", TEST_HANG,
+			"Hang test for pipe CRC read." },
+	};
+	int i;
+	last_crtc_index = 0;
+
+	igt_fixture() {
+		data.drm_fd = drm_open_driver_master(DRIVER_ANY);
+
+		kmstest_set_vt_graphics_mode();
+
+		igt_require_pipe_crc(data.drm_fd);
+
+		igt_display_require(&data.display, data.drm_fd);
+		igt_display_require_output(&data.display);
+		igt_require_pipe_crc(data.drm_fd);
+
+		data.debugfs = igt_debugfs_dir(data.drm_fd);
+
+		/* Get active pipes. */
+		for_each_crtc(&data.display, crtc)
+			active_crtcs[last_crtc_index++] = crtc->crtc_index;
+		last_crtc_index--;
+	}
+
+	igt_describe("Tests error handling when the bad source is set.");
+	igt_subtest("bad-source")
+		test_bad_source(&data);
+
+	for (i = 0; i < ARRAY_SIZE(tests); i++) {
+		igt_describe(tests[i].desc);
+		igt_subtest_with_dynamic(tests[i].name) {
+			for_each_crtc_with_single_output(&data.display, crtc,
+							 output) {
+				if (simulation_constraint(crtc))
+					continue;
+
+				if(!crtc_output_combo_valid(&data.display, crtc, output))
+					continue;
+
+				igt_dynamic_f("pipe-%s-%s",
+					      igt_crtc_name(crtc),
+					      output->name) {
+					if (tests[i].flags & TEST_SUSPEND) {
+						enum igt_suspend_test test = SUSPEND_TEST_NONE;
+
+						test_read_crc(&data,
+							      crtc,
+							      output, 0);
+
+						/* rtcwake cmd is not supported on MTK devices */
+						if (is_mtk_device(data.drm_fd))
+							test = SUSPEND_TEST_DEVICES;
+
+						igt_system_suspend_autoresume(SUSPEND_STATE_MEM,
+									      test);
+
+						test_read_crc(&data,
+							      crtc,
+							      output, 0);
+					} else if (tests[i].flags & TEST_HANG) {
+						igt_hang_t hang = igt_allow_hang(data.drm_fd, 0, 0);
+
+						test_read_crc(&data,
+							      crtc,
+							      output, 0);
+						igt_force_gpu_reset(data.drm_fd);
+						test_read_crc(&data,
+							      crtc,
+							      output, 0);
+
+						igt_disallow_hang(data.drm_fd, hang);
+					} else {
+						test_read_crc(&data,
+							      crtc,
+							      output,
+							      tests[i].flags);
+					}
+				}
+			}
+		}
+	}
+
+	igt_describe("Check that disabling CRCs on a CRTC after having disabled the CRTC "
+		     "does not cause issues.");
+	igt_subtest_with_dynamic("disable-crc-after-crtc") {
+		for_each_crtc_with_single_output(&data.display, crtc, output) {
+			if (simulation_constraint(crtc))
+				continue;
+
+			if(!crtc_output_combo_valid(&data.display, crtc, output))
+				continue;
+
+			igt_dynamic_f("pipe-%s-%s", igt_crtc_name(crtc),
+				      output->name)
+				test_disable_crc_after_crtc(&data,
+							    crtc,
+							    output);
+		}
+	}
+
+	igt_describe("Basic sanity check for CRC mismatches with XR24 format");
+	igt_subtest_with_dynamic("compare-crc-sanitycheck-xr24") {
+		for_each_crtc_with_single_output(&data.display, crtc, output) {
+			if (simulation_constraint(crtc))
+				continue;
+
+			if(!crtc_output_combo_valid(&data.display, crtc, output))
+				continue;
+
+			igt_dynamic_f("pipe-%s-%s", igt_crtc_name(crtc),
+				      output->name)
+				test_compare_crc(&data,
+						 crtc,
+						 output,
+						 DRM_FORMAT_XRGB8888);
+		}
+	}
+
+	igt_describe("Basic sanity check for CRC mismatches with NV12 format");
+	igt_subtest_with_dynamic("compare-crc-sanitycheck-nv12") {
+		for_each_crtc_with_single_output(&data.display, crtc, output) {
+			if (simulation_constraint(crtc))
+				continue;
+
+			if(!crtc_output_combo_valid(&data.display, crtc, output))
+				continue;
+
+			igt_dynamic_f("pipe-%s-%s", igt_crtc_name(crtc),
+				      output->name)
+				test_compare_crc(&data,
+						 crtc,
+						 output,
+						 DRM_FORMAT_NV12);
+		}
+	}
+
+	igt_fixture() {
+		igt_display_fini(&data.display);
+		drm_close_driver(data.drm_fd);
+	}
+}

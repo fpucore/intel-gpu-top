@@ -1,0 +1,113 @@
+{
+    "version": "1.3",
+    "PFResources": {
+        "Default": "MinimumPFResources",
+        "Profile": {
+            "MinimumPFResources": {
+                "LocalMemoryEccOn": 134217728,
+                "LocalMemoryEccOff": 134217728,
+                "Contexts": 256,
+                "Doorbells": 16,
+                "GGTTSize": 67108864
+            }
+        }
+    },
+    "vGPUResources": {
+        "Default": null,
+        "Profile": {
+            "Bmg_12": {
+                "VFCount": 1,
+                "LocalMemoryEccOff": 12616466432,
+                "LocalMemoryEccOn": 12616466432,
+                "Contexts": 1024,
+                "Doorbells": 240,
+                "GGTTSize": 4026531840
+            },
+            "Bmg_6": {
+                "VFCount": 2,
+                "LocalMemoryEccOff": 6341787648,
+                "LocalMemoryEccOn": 6341787648,
+                "Contexts": 1024,
+                "Doorbells": 120,
+                "GGTTSize": 2013265920
+            },
+            "Bmg_4": {
+                "VFCount": 3,
+                "LocalMemoryEccOff": 4211081216,
+                "LocalMemoryEccOn": 4211081216,
+                "Contexts": 1024,
+                "Doorbells": 80,
+                "GGTTSize": 1342177280
+            },
+            "Bmg_2": {
+                "VFCount": 6,
+                "LocalMemoryEccOff": 2080374784,
+                "LocalMemoryEccOn": 2080374784,
+                "Contexts": 1024,
+                "Doorbells": 40,
+                "GGTTSize": 671088640
+            },
+            "Bmg_1": {
+                "VFCount": 12,
+                "LocalMemoryEccOff": 1023410176,
+                "LocalMemoryEccOn": 1023410176,
+                "Contexts": 1024,
+                "Doorbells": 20,
+                "GGTTSize": 251658240
+            }
+        }
+    },
+    "vGPUScheduler": {
+        "Default": "Flexible_30fps_GPUTimeSlicing",
+        "Profile": {
+            "Flexible_30fps_GPUTimeSlicing": {
+                "GPUTimeSlicing": {
+                    "ScheduleIfIdle": false,
+                    "PFExecutionQuantum": 20,
+                    "PFPreemptionTimeout": 20000,
+                    "VFAttributes": {
+                        "VFExecutionQuantum": "lambda VFCount : max( 32 // VFCount, 1)",
+                        "VFPreemptionTimeout": "lambda VFCount : 128000 if (VFCount == 1) else max( 64000 // VFCount, 16000)"
+                    }
+                }
+            },
+            "Fixed_30fps_GPUTimeSlicing": {
+                "GPUTimeSlicing": {
+                    "ScheduleIfIdle": true,
+                    "PFExecutionQuantum": 20,
+                    "PFPreemptionTimeout": 20000,
+                    "VFAttributes": {
+                        "VFExecutionQuantum": "lambda VFCount : max( 32 // VFCount, 1)",
+                        "VFPreemptionTimeout": "lambda VFCount : 128000 if (VFCount == 1) else max( 64000 // VFCount, 16000)"
+                    }
+                }
+            },
+            "Flexible_BurstableQoS_GPUTimeSlicing": {
+                "GPUTimeSlicing": {
+                    "ScheduleIfIdle": false,
+                    "PFExecutionQuantum": 20,
+                    "PFPreemptionTimeout": 20000,
+                    "VFAttributes": {
+                        "VFExecutionQuantum": "lambda VFCount : min((2000 // max(VFCount-1,1)*0.5, 50))",
+                        "VFPreemptionTimeout": "lambda VFCount : (2000 // max(VFCount-1,1) - min((2000 // max(VFCount-1,1))*0.5, 50))*1000"
+                    }
+                }
+            }
+        }
+    },
+    "vGPUSecurity": {
+        "Default": "Disabled",
+        "Profile": {
+            "Disabled": {
+                "ResetAfterVfSwitch": false,
+                "GuCSamplingPeriod": 0,
+                "GuCThresholdCATError": 0,
+                "GuCThresholdPageFault": 0,
+                "GuCThresholdH2GStorm": 0,
+                "GuCThresholdDbStorm": 0,
+                "GuCThresholdGTIrqStorm": 0,
+                "GuCThresholdEngineReset": 0
+            }
+        }
+    }
+}

@@ -1,0 +1,16 @@
+###############################################################
+# VF S/R scenario: long preemptable batches
+#
+# 1. Run 100ms preempable batches on each engine
+# 2. Emit the workload for 20s (rerun in a loop) - keep executing during the migration.
+#    Use 'gem_wsim -r 200' that gives: 0.1s * 10 = 1s * 20 = 20s
+# 3. Finish execution in post-migration phase
+#
+# PTL variant - engines:
+# RCS, BCS, VCS-1, VECS-1, CCS
+###############################################################
+1.RCS.100000.0.0
+1.BCS.100000.0.0
+1.VCS-1.100000.0.0
+1.VECS-1.100000.0.0
+1.CCS.100000.0.1

@@ -1,0 +1,78 @@
+{
+    "description": "JSON file to be used to parse KMS documentation",
+    "name": "Display and KMS Tests for Intel i915 and Xe Drivers",
+    "drivers": [ "xe", "i915" ],
+    "files": [ "../chamelium/kms_*.c", "../fbdev.c", "../kms_*.c", "../testdisplay.c", "kms_*.c" ],
+    "exclude_files": [ "../chamelium/kms_chamelium_helper.c", "../kms_color_helper.c",
+                       "kms_dsc_helper.c" ],
+    "fields": {
+        "Run type": {
+            "_properties_": {
+                "description": "Defines what category of testlist it belongs",
+                "update-from-file": {
+                    "append-value-if-not-excluded": "Xe FULL, i915 FULL",
+                    "exclude-type": "regex-ignorecase",
+                    "include": [
+                        { "i915 BAT": "../intel-ci/i915.fast-feedback.testlist" },
+                        { "i915 BAT chamelium": "../intel-ci/i915.fast-feedback-chamelium-only.testlist" },
+                        { "i915 FULL chamelium": "../intel-ci/chamelium-only.testlist" },
+
+                        { "Xe BAT": "../intel-ci/xe.fast-feedback.testlist" },
+                        { "Xe BAT chamelium": "../intel-ci/xe.fast-feedback-chamelium-only.testlist" },
+                        { "Xe FULL chamelium": "../intel-ci/chamelium-only.testlist" }
+                    ],
+                    "exclude": [
+                        { "i915 BAT, i915 BAT chamelium, i915 FULL chamelium, i915 FULL": "../intel-ci/i915.blocklist.txt" },
+                            { "Xe BAT, Xe BAT chamelium, Xe FULL chamelium, Xe FULL": "../intel-ci/xe.blocklist.txt" }
+                    ]
+                }
+            },
+            "Category": {
+                "_properties_": {
+                    "description": "Contains the major group for the tested functionality 'Display'"
+                },
+                "Mega feature": {
+                    "_properties_": {
+                        "description": "Contains the mega feature for end to end use case, e.g. the 'PSR' feature."
+                    },
+                    "Functionality": {
+                        "_properties_": {
+                            "description": "Groups tests on buckets containg more detailed functionality"
+                        }
+                    }
+                }
+            }
+        },
+        "Driver requirement": {
+            "_properties_": {
+                "description": "Describes any Driver specific requrirement, like i915/xe."
+            }
+        },
+        "Test category": {
+            "_properties_": {
+                "description": "Defines the test category. Usually used at subtest level."
+            }
+        },
+	"GPU excluded platform": {
+	    "_properties_": {
+		"description": "Provides a list of GPUs not capable of running the subtest (or the test as a whole).",
+		"update-from-file": {
+		    "include-type": "regex-ignorecase",
+		    "include": [
+			{ "LNL": "../intel-ci/xe.lnl.display.blocklist.txt" },
+			{ "BMG": "../intel-ci/xe.bmg.display.blocklist.txt" },
+			{ "PTL": "../intel-ci/xe.ptl.display.blocklist.txt" },
+			{ "NVL": "../intel-ci/xe.nvl.display.blocklist.txt" },
+			{ "LNL, BMG, PTL, NVL": "../intel-ci/xe.blocklist.txt" },
+			{ "ADLP, ADLS, DG2, MTL": "../intel-ci/i915.blocklist.txt" }
+		    ]
+		}
+	    }
+	},
+        "Description": {
+            "_properties_": {
+                "description": "Provides a description for the test/subtest."
+            }
+        }
+    }
+}

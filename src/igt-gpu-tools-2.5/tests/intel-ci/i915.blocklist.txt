@@ -1,0 +1,215 @@
+###############################################
+# This file is for non-Xe tests only
+###############################################
+igt@xe.*
+igt@.*@xe.*
+
+igt@meta_test(@.*)?
+
+###############################################
+# Expects the i915 module not loaded, SKIPs if one is loaded.
+# Intended only for CI BAT runs as the very first test executed.
+# Not suitable for CI runs with random test selection and ordering.
+# Omitting it from non-BAT runs doesn't affect coverage, then
+# let's blocklist it instead of maintainig as expected SKIP.
+###############################################
+igt@i915_module_load@load
+
+###############################################
+# Handle module reloads with great care!
+#
+# Reloading a module is more likely to leave
+# the machine in an unexpected state than other
+# self-contained tests, leading to random
+# failures in tests run afterwards.
+###############################################
+#igt@i915_module_load(@.*)? # danger, danger; hope for taints!
+igt@i915_pm_rpm@module-reload
+igt@i915_pm_rpm@gem-execbuf-stress-extra-wait
+###############################################
+# GEM
+###############################################
+igt@gem_busy@hang.*
+igt@gem_close_race@(?!.*basic).*
+igt@gem_concurrent_blit(@.*)?
+igt@gem_ctx_create@(?!.*basic).*
+igt@gem_ctx_exec@(?!.*basic).*
+igt@gem_ctx_shared@*exhaust*
+igt@gem_ctx_switch(@.*)?
+igt@gem_evict_alignment(@.*)?
+igt@gem_evict_everything(@.*)?
+igt@gem_exec_big@(?!.*single).*
+igt@gem_exec_capture@many-.*
+igt@gem_exec_fair(@.*)?
+igt@gem_exec_fence@.*hang.*
+igt@gem_exec_flush@(?!.*basic).*
+igt@gem_exec_latency(@.*)?
+igt@gem_exec_lut_handle(@.*)?
+igt@gem_exec_nop@(?!.*basic).*
+igt@gem_exec_reloc@(?!.*basic).*
+igt@gem_exec_suspend@(?!.*basic).*
+igt@gem_exec_whisper@(?!basic).*
+igt@gem_fd_exhaustion(@.*)?
+igt@gem_fence_upload(@.*)?
+igt@gem_gtt_hog(@.*)?
+igt@gem_gtt_speed(@.*)?
+igt@gem_lut_handle(@.*)?
+igt@gem_mmap_gtt@.*(huge|swap|clflush|forked).*
+igt@gem_mmap@.*(swap|huge).*
+igt@gem_pread_after_blit(@.*)?
+igt@gem_pwrite@(?!.*basic).*
+igt@gem_read_read_speed(@.*)?
+igt@gem_render_linear_blits@(?!.*basic).*
+igt@gem_render_tiled_blits@(?!.*basic).*
+igt@gem_reset_stats(@.*)?
+igt@gem_ringfill@(?!.*basic).*
+igt@gem_shrink@(?!reclaim$).*
+igt@gem_softpin@.*(hang|S4).*
+igt@gem_streaming_writes(@.*)?
+igt@gem_sync@(?!.*basic).*
+igt@gem_tiled_swapping@(?!non-threaded).*
+igt@gem_userptr_blits@(major|minor|forked|mlocked|swapping).*
+igt@gem_wait@hang.*
+igt@gem_watchdog@far-fence
+igt@sysfs_heartbeat_interval@(long|off)
+igt@sysfs_preempt_timeout@off
+igt@sysfs_timeslice_duration@off
+###############################################
+# GEM: Not worth fixing
+###############################################
+igt@gen7_exec_parse@.*lri.*
+igt@gem_exec_alignment@pi-shared
+###############################################
+# There are no DRRS capable displays in CI lab
+###############################################
+igt@kms_frontbuffer_tracking@.*drrs.*
+###############################################
+# Maximum downscale must be less than 3.0 in
+# each direction
+###############################################
+igt@kms_plane_scaling@.*downscale-factor-0-25.*
+###############################################
+# Tends to generate invalid configurations
+# using CCS planes or configurations that
+# exceed HW capabilities resulting in sporadic
+# failure with -EINVAL.
+#
+# Maintaining extra constraints for Intel's HW
+# is too costly in comparison to the value
+# provided.
+###############################################
+igt@kms_chamelium_frames@hdmi-.*-planes-random
+###############################################
+# Broadcom
+###############################################
+igt@vc4.*
+igt@v3d.*
+###############################################
+# AMD
+###############################################
+igt@amdgpu.*
+igt@kms_async_flips@overlay-atomic
+###############################################
+# Apple
+###############################################
+igt@asahi.*
+###############################################
+# VMware
+###############################################
+igt@vmwgfx.*
+###############################################
+# Panfrost
+###############################################
+igt@panfrost.*
+###############################################
+# Panthor
+###############################################
+igt@panthor.*
+###############################################
+# Qualcomm
+###############################################
+igt@msm.*
+###############################################
+# VirtIO-GPU
+###############################################
+igt@.*virtgpu.*
+###############################################
+# VKMS
+###############################################
+igt@vkms.*
+###############################################
+# Hibernate: not configured correctly on CI
+###############################################
+igt@.*@.*-hibernate
+igt@gem_softpin@noreloc-s4
+igt@gem_workarounds@hibernate-.*
+igt@gem_exec_suspend@basic-s4$
+igt@gem_ctx_isolation@.*-s4
+###############################################
+# Out-of-memory: spammy and often broken
+###############################################
+igt@i915_suspend@shrink
+###############################################
+# pipe-e to pipe-p no current HW support
+###############################################
+igt@.*@.*pipe-[e-pE-P]($|-.*)
+
+###############################################
+# Temporary workarounds for CI-impacting bugs
+###############################################
+
+# Currently fails and leaves the machine in a very bad state, and
+# causes coverage loss for other tests. IOMMU related.
+# https://gitlab.freedesktop.org/drm/intel/-/issues/2644
+igt@core_hotunplug@.*(hot|plug).*
+
+# hangs several gens of hosts, and has no immediate fix
+igt@device_reset@reset-bound
+
+# not working for i915
+igt@kms_bw@.*
+
+# Tests specific to (Display_ver > 14) are not applicable for i915
+igt@kms_ccs@.*-4-tiled-xe2-ccs
+igt@kms_fbc_dirty_rect.*
+igt@kms_frontbuffer_tracking@plane-fbc-rte
+igt@kms_pm_dc@deep-pkgc
+igt@kms_vrr@cmrr
+igt@kms_fbc_dirty_rect.*
+igt@kms_sharpness_filter@.*
+igt@kms_chamelium_sharpness_filter@.*
+
+###############################################
+# Test was written with the idea that edid read shouldn't take an
+# unreasonable amount of time. The timeout is an arbitrary value
+# because it depends on when the display responds and, in some cases,
+# especially when the display is coming back from sleep, it can take
+# quite a while. This test has sporadic behavior across various
+# platforms connected to different displays.
+###############################################
+igt@kms_sysfs_edid_timing
+##################################################################
+# Chamelium V1 HDMI receiver supports a maximum resolution
+# of 4K @ 30Hz. This test enforces an EDID with 4K @ 60Hz,
+# which exceeds the capabilities of V1 hardware and results
+# in failures. Temporarily blocklist this test until V3 Chamelium
+# boards (which support 4K @ 60Hz) are available in the test environment.
+##################################################################
+igt@kms_chamelium_edid@hdmi-edid-stress-resolution-4k
+##################################################################
+# KMS: Yet to add/missing i915 support
+##################################################################
+igt@kms_writeback@writeback.*
+igt@kms_colorop@.*
+##################################################################
+# Valid skip : 3D LUT is supported NVL+
+##################################################################
+igt@kms_color_pipeline@plane-lut3d-green-only
+##################################################################
+# Valid skip :- For display ver >= 35
+##################################################################
+igt@kms_frontbuffer_tracking@.*a(bgr|rgb)161616f.*
+igt@kms_flip_scaled_crc@.*linear-reflect-x
+igt@kms_pm_dc@dc3co-.*
+igt@kms_vrr@lobf-dc3co
+##################################################################
