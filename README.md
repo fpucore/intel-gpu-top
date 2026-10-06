@@ -2,17 +2,17 @@
 
 ![intel_gpu_top](demo/sample.webp)
 
-A modernized, patched and repackaged version of the intel_gpu_top program, providing real-time monitoring of Intel GPU activity from the Linux terminal console.
+A modernized, patched and repackaged version of the **intel_gpu_top** program, providing real-time monitoring of Intel GPU activity from the Linux terminal console.
 
 ## Building
 
-Developed and packaged specifically for compiling on GNU Operating System / H-Linux.
+Developed and packaged specifically for compiling on **GNU Operating System / H-Linux**.
 
 Build and install the package with the prompt:
 
 ```bash
 > makepkg -sei
-```bash
+```
 
 ## License
 
